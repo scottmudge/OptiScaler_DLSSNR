@@ -282,6 +282,24 @@ float3 SoftKnee(float3 display)
         display *= rolled / displayLuma;
     }
 
+    // Per-channel headroom, with the hue kept.
+    //
+    // The roll-off above is on luminance, and luminance is a weighted sum in which blue counts for
+    // seven percent. A saturated blue can therefore sit at B = 2 with a luminance of 0.14, pass the
+    // knee untouched, and be clipped per channel by the saturate in LinearToSrgb -- and clipping one
+    // channel of a triple is a hue rotation, so blue arrives as cyan. That was the green cast over
+    // every blue thing in GTA V at colour strength 1: the sky, the denim, the minimap. The model was
+    // shown a cyan proxy, answered in cyan, and at colour strength 1 its hue is the frame's hue.
+    //
+    // One scalar on the whole triple cannot move hue, so the peak channel is brought to 1 that way.
+    // Only pixels that were already being clipped are touched, so everything else is bit-identical
+    // to before, and the resolve's reconstruction of this proxy stays exact because it goes through
+    // this same function.
+    float peak = max(display.r, max(display.g, display.b));
+
+    if (peak > 1.0)
+        display /= peak;
+
     return display;
 }
 
@@ -329,6 +347,59 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // the meter this replaces measured: that reads scene brightness, and a dark scene then asks for a
     // small divisor and hands the model a blown picture anyway. Not the frame's maximum either, which
     // one specular hit decides.
+    // What scale is this game's buffer on?
+    //
+    // Not a taste question. The composition divides the frame by paper white to work in a normalised
+    // space, and the right divisor is the one that lands the picture in [0,1]. Nioh 3 needs about 240
+    // because its linear buffer holds values around two hundred; GTA V's exposure yields 2.7. Below
+    // the correct value the frame is never normalised, the headroom branch computes ratios in the
+    // hundreds, and ToOkLab is handed values far outside the range its cube root was built for -- the
+    // green tint.
+    //
+    // Measured from the UNTOUCHED copy the encode kept, never from the frame this pass writes. That
+    // distinction is the whole reason this is safe where the old white point meter was not: that one
+    // read its own output and chased it, walking one Enshrouded session from 0.010 to 97.910. There
+    // is no path from what this pass writes back into what this reads.
+    //
+    // Per tile, the peak luminance rather than the mean. The mean is scene brightness and says
+    // nothing about scale; the peak says where the top of the range is, which is exactly what the
+    // divisor has to match. One specular hit cannot decide the answer because the host takes a
+    // percentile across tiles afterwards.
+    if (gMode == 4)
+    {
+        uint fullW, fullH;
+        gSource.GetDimensions(fullW, fullH);
+
+        const uint tx0 = (uint) (((float) id.x * (float) fullW) / (float) gWidth);
+        const uint tx1 = (uint) (((float) (id.x + 1) * (float) fullW) / (float) gWidth);
+        const uint ty0 = (uint) (((float) id.y * (float) fullH) / (float) gHeight);
+        const uint ty1 = (uint) (((float) (id.y + 1) * (float) fullH) / (float) gHeight);
+
+        // Sixteen samples a side rather than eight, and offset half a step in so the lattice does not
+        // sit on the tile's own corner.
+        //
+        // A fixed sample count over a growing tile means a shrinking fraction of it is read: eight per
+        // side covers about 17% of a tile at 1080p but only 4% at 4K, so the same scene reported a
+        // lower peak -- and therefore a smaller suggested divisor -- the higher the resolution. That is
+        // a measurement that changes with the setting rather than with the game.
+        const uint stepX = max((tx1 - tx0) / 16u, 1u);
+        const uint stepY = max((ty1 - ty0) / 16u, 1u);
+
+        float peak = 0.0;
+
+        for (uint ty = ty0; ty < max(ty1, ty0 + 1u); ty += stepY)
+        {
+            for (uint tx = tx0; tx < max(tx1, tx0 + 1u); tx += stepX)
+            {
+                const float3 c = max(gSource.Load(int3(min(tx, fullW - 1u), min(ty, fullH - 1u), 0)).rgb, 0.0);
+                peak = max(peak, dot(c, kLuma));
+            }
+        }
+
+        gTarget[id.xy] = float4(peak, 0.0, 0.0, 1.0);
+        return;
+    }
+
     if (gMode == 3)
     {
         // Tile (0,0) carries the game's own exposure rather than a tile mean.

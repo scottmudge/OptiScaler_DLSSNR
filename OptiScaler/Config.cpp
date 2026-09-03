@@ -324,6 +324,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             DlssNrTransfer.set_from_config(readUInt("DlssNr", "Transfer"));
 
             DlssNrWhitePointFromExposure.set_from_config(readBool("DlssNr", "WhitePointFromExposure"));
+            DlssNrProbeD3D11.set_from_config(readBool("DlssNr", "ProbeD3D11"));
             DlssNrDebugView.set_from_config(readUInt("DlssNr", "DebugView"));
             DlssNrCompare.set_from_config(readUInt("DlssNr", "Compare"));
             DlssNrCompareSplit.set_from_config(readFloat("DlssNr", "CompareSplit"));
@@ -334,6 +335,22 @@ bool Config::Reload(std::filesystem::path iniPath)
             DlssNrWorkingScale.set_from_config(readFloat("DlssNr", "WorkingScale"));
             DlssNrProxyProbe.set_from_config(readBool("DlssNr", "ProxyProbe"));
             DlssNrUseProxy.set_from_config(readBool("DlssNr", "UseProxy"));
+            DlssNrScanExposure.set_from_config(readBool("DlssNr", "ScanExposure"));
+            DlssNrWhitePointSource.set_from_config(readUInt("DlssNr", "WhitePointSource"));
+
+            // Migrate the retired flag only when the new key was genuinely absent, which is why this
+            // has to run AFTER the read above -- set_from_config assigns only into an empty optional,
+            // so an ini that carries both keys keeps its explicit WhitePointSource.
+            if (!DlssNrWhitePointSource.has_value() && DlssNrWhitePointFromExposure.has_value())
+                DlssNrWhitePointSource = DlssNrWhitePointFromExposure.value() ? 1u : 0u;
+            DlssNrScanMeter.set_from_config(readBool("DlssNr", "ScanMeter"));
+            DlssNrScanTrim.set_from_config(readFloat("DlssNr", "ScanTrim"));
+            DlssNrPasses.set_from_config(readUInt("DlssNr", "Passes"));
+            DlssNrScanAnchorValue.set_from_config(readFloat("DlssNr", "ScanAnchorValue"));
+            DlssNrScanAnchorWhitePoint.set_from_config(readFloat("DlssNr", "ScanAnchorWhitePoint"));
+            DlssNrScanAnchors.set_from_config(readString("DlssNr", "ScanAnchors"));
+            DlssNrScanInverted.set_from_config(readBool("DlssNr", "ScanInverted"));
+            DlssNrWhitePointTrim.set_from_config(readFloat("DlssNr", "WhitePointTrim"));
             DlssNrAutoCapture.set_from_config(readBool("DlssNr", "AutoCapture"));
             DlssNrWhitePointScale.set_from_config(readFloat("DlssNr", "WhitePointScale"));
             DlssNrPreset.set_from_config(readUInt("DlssNr", "Preset"));
@@ -1184,6 +1201,8 @@ bool Config::SaveIni()
     ini.SetValue("DlssNr", "MaxRatio", GetFloatValue(Instance()->DlssNrMaxRatio.value_for_config()).c_str());
     ini.SetValue("DlssNr", "Transfer", GetIntValue(Instance()->DlssNrTransfer.value_for_config()).c_str());
 
+    ini.SetValue("DlssNr", "ProbeD3D11",
+                 GetBoolValue(Instance()->DlssNrProbeD3D11.value_for_config()).c_str());
     ini.SetValue("DlssNr", "WhitePointFromExposure",
                  GetBoolValue(Instance()->DlssNrWhitePointFromExposure.value_for_config()).c_str());
     ini.SetValue("DlssNr", "DebugView", GetIntValue(Instance()->DlssNrDebugView.value_for_config()).c_str());
@@ -1200,6 +1219,23 @@ bool Config::SaveIni()
                  GetFloatValue(Instance()->DlssNrTagScale.value_for_config()).c_str());
     ini.SetValue("DlssNr", "WorkingScale", GetFloatValue(Instance()->DlssNrWorkingScale.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AutoCapture", GetBoolValue(Instance()->DlssNrAutoCapture.value_for_config()).c_str());
+
+    // These were read every launch but never written, so nothing set through the menu survived a
+    // restart -- the white-point source, both trims, the anchor, the pass count and the rest all
+    // reset to default on the next run.
+    ini.SetValue("DlssNr", "WhitePointSource", GetIntValue(Instance()->DlssNrWhitePointSource.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "WhitePointTrim", GetFloatValue(Instance()->DlssNrWhitePointTrim.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanTrim", GetFloatValue(Instance()->DlssNrScanTrim.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanAnchorValue", GetFloatValue(Instance()->DlssNrScanAnchorValue.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanAnchorWhitePoint", GetFloatValue(Instance()->DlssNrScanAnchorWhitePoint.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanAnchors", Instance()->DlssNrScanAnchors.value_for_config_or("").c_str());
+    ini.SetValue("DlssNr", "ScanInverted", GetBoolValue(Instance()->DlssNrScanInverted.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanMeter", GetBoolValue(Instance()->DlssNrScanMeter.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Passes", GetIntValue(Instance()->DlssNrPasses.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "UseProxy", GetBoolValue(Instance()->DlssNrUseProxy.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ProxyProbe", GetBoolValue(Instance()->DlssNrProxyProbe.value_for_config()).c_str());
+    // ScanExposure is a developer override with no menu control; persist it so a set ini keeps it.
+    ini.SetValue("DlssNr", "ScanExposure", GetBoolValue(Instance()->DlssNrScanExposure.value_for_config()).c_str());
     ini.SetValue("DlssNr", "WhitePointScale",
                  GetFloatValue(Instance()->DlssNrWhitePointScale.value_for_config()).c_str());
     ini.SetValue("DlssNr", "Preset", GetIntValue(Instance()->DlssNrPreset.value_for_config()).c_str());
