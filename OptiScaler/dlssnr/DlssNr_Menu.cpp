@@ -472,7 +472,7 @@ void RenderMenu(Config* config, float menuResScale)
                 else if (ex.exposure > 1e-6f)
                 {
                     const float trim =
-                        std::clamp(config->DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f);
+                        std::clamp(config->DlssNrWhitePointTrim.value_or_default(), 0.01f, 4.0f);
                     ImGui::TextColored(ImVec4(0.45f, 0.8f, 0.45f, 1.0f),
                                        "Game exposure %.4f  ->  white point %.2f%s", ex.exposure,
                                        ex.preExposure / ex.exposure * trim,
@@ -604,7 +604,7 @@ void RenderMenu(Config* config, float menuResScale)
                 else
                     snprintf(lbl, sizeof(lbl), "Paper white");
 
-                if (ImGui::SliderFloat(lbl, &pw, 0.25f, 2000.0f, "%.2fx", ImGuiSliderFlags_Logarithmic))
+                if (ImGui::SliderFloat(lbl, &pw, 0.01f, 2000.0f, "%.2fx", ImGuiSliderFlags_Logarithmic))
                 {
                     if (editingRow)
                     {
@@ -630,9 +630,9 @@ void RenderMenu(Config* config, float menuResScale)
             {
                 float trim = config->DlssNrScanTrim.value_or_default();
 
-                if (ImGui::SliderFloat("Trim (x the scan)", &trim, 0.25f, 4.0f, "%.2fx",
+                if (ImGui::SliderFloat("Trim (x the scan)", &trim, 0.01f, 4.0f, "%.2fx",
                                        ImGuiSliderFlags_Logarithmic))
-                    config->DlssNrScanTrim = std::clamp(trim, 0.25f, 4.0f);
+                    config->DlssNrScanTrim = std::clamp(trim, 0.01f, 4.0f);
 
                 ImGui::SameLine();
 
@@ -653,12 +653,12 @@ void RenderMenu(Config* config, float menuResScale)
                                 : config->DlssNrWhitePointTrim.value_or_default();
 
             if (ImGui::SliderFloat(ofScan ? "Trim (x the scan)" : "Trim (x the game's exposure)", &trim,
-                                   0.25f, 4.0f, "%.2fx", ImGuiSliderFlags_Logarithmic))
+                                   0.01f, 4.0f, "%.2fx", ImGuiSliderFlags_Logarithmic))
             {
                 if (ofScan)
-                    config->DlssNrScanTrim = std::clamp(trim, 0.25f, 4.0f);
+                    config->DlssNrScanTrim = std::clamp(trim, 0.01f, 4.0f);
                 else
-                    config->DlssNrWhitePointTrim = std::clamp(trim, 0.25f, 4.0f);
+                    config->DlssNrWhitePointTrim = std::clamp(trim, 0.01f, 4.0f);
             }
 
             ImGui::SameLine();
@@ -692,7 +692,7 @@ void RenderMenu(Config* config, float menuResScale)
             // of anything that can be bounded here. One tester was still improving at 100.
             float wpScale = config->DlssNrWhitePointScale.value_or_default();
 
-            if (ImGui::SliderFloat("Paper white", &wpScale, 0.25f, 2000.0f, "%.2fx",
+            if (ImGui::SliderFloat("Paper white", &wpScale, 0.01f, 2000.0f, "%.2fx",
                                    ImGuiSliderFlags_Logarithmic))
                 config->DlssNrWhitePointScale = wpScale;
 
