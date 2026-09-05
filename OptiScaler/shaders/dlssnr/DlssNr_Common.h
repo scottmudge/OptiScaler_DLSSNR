@@ -96,6 +96,15 @@ struct DlssNrFrameInfo
     // available and is what gets used.
     unsigned int RenderSubrectWidth = 0;
     unsigned int RenderSubrectHeight = 0;
+
+    unsigned int DepthSubrectBaseX = 0;
+    unsigned int DepthSubrectBaseY = 0;
+    unsigned int MotionSubrectBaseX = 0;
+    unsigned int MotionSubrectBaseY = 0;
+
+    // DLSS permits motion vectors at either render or output resolution. This flag comes from the
+    // feature-create flags and decides which valid-region dimensions apply to the motion texture.
+    bool MotionVectorsLowResolution = false;
 };
 
 struct alignas(256) DlssNrConstants
