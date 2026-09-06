@@ -668,6 +668,9 @@ __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, voi
                                              void *color, void *depth, void *motion, void *output,
                                              unsigned int width, unsigned int height,
                                              unsigned int guideWidth, unsigned int guideHeight,
+                                             unsigned int motionWidth, unsigned int motionHeight,
+                                             unsigned int depthBaseX, unsigned int depthBaseY,
+                                             unsigned int motionBaseX, unsigned int motionBaseY,
                                              int depthInverted, int reset, float intensity, int style,
                                              float localStructure, float localTone, float skinStructure,
                                              int useAutoMask, float mvScaleX, float mvScaleY) {
@@ -696,14 +699,14 @@ __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, voi
     setUInt(capabilityParams, "DLSSNR.OutputSubrectBaseY", 0);
     setUInt(capabilityParams, "DLSSNR.OutputSubrectWidth", width);
     setUInt(capabilityParams, "DLSSNR.OutputSubrectHeight", height);
-    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseX", 0);
-    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseY", 0);
+    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseX", depthBaseX);
+    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseY", depthBaseY);
     setUInt(capabilityParams, "DLSSNR.DepthSubrectWidth", guideWidth);
     setUInt(capabilityParams, "DLSSNR.DepthSubrectHeight", guideHeight);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseX", 0);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseY", 0);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectWidth", guideWidth);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectHeight", guideHeight);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseX", motionBaseX);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseY", motionBaseY);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectWidth", motionWidth);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectHeight", motionHeight);
 
     // The game's own encoding, passed through rather than derived. Deriving it from the resolutions
     // came out as exactly 1.0 at native, which told the model almost nothing had moved.
@@ -785,7 +788,10 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
                                                ID3D12Resource *depth, ID3D12Resource *motion,
                                                ID3D12Resource *output, unsigned int width,
                                                unsigned int height, unsigned int guideWidth,
-                                               unsigned int guideHeight, int depthInverted, int reset,
+                                               unsigned int guideHeight, unsigned int motionWidth,
+                                               unsigned int motionHeight, unsigned int depthBaseX,
+                                               unsigned int depthBaseY, unsigned int motionBaseX,
+                                               unsigned int motionBaseY, int depthInverted, int reset,
                                                float intensity, int style, float localStructure,
                                                float localTone, float skinStructure, int useAutoMask,
                                                float mvScaleX, float mvScaleY) {
@@ -813,14 +819,14 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     setUInt(capabilityParams, "DLSSNR.OutputSubrectBaseY", 0);
     setUInt(capabilityParams, "DLSSNR.OutputSubrectWidth", width);
     setUInt(capabilityParams, "DLSSNR.OutputSubrectHeight", height);
-    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseX", 0);
-    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseY", 0);
+    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseX", depthBaseX);
+    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseY", depthBaseY);
     setUInt(capabilityParams, "DLSSNR.DepthSubrectWidth", guideWidth);
     setUInt(capabilityParams, "DLSSNR.DepthSubrectHeight", guideHeight);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseX", 0);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseY", 0);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectWidth", guideWidth);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectHeight", guideHeight);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseX", motionBaseX);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseY", motionBaseY);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectWidth", motionWidth);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectHeight", motionHeight);
 
     // The game's own encoding, passed through. Deriving this from the resolutions was a guess, and at
     // native resolution it came out as exactly 1.0 -- so a game using normalised vectors was telling
