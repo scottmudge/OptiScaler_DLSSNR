@@ -494,6 +494,17 @@ bool Config::Reload(std::filesystem::path iniPath)
             }
         }
 
+        // Keyboard input fix (frame-dependent input sampling, e.g. Kingdom Come)
+        {
+            KcdInputFixEnabled.set_from_config(readBool("KcdInputFix", "Enabled"));
+            KcdInputFixMode.set_from_config(readInt("KcdInputFix", "Mode"));
+            KcdInputFixPollHz.set_from_config(readInt("KcdInputFix", "PollHz"));
+            KcdInputFixDebounceMs.set_from_config(readInt("KcdInputFix", "DebounceMs"));
+            KcdInputFixHoldMs.set_from_config(readInt("KcdInputFix", "HoldMs"));
+            KcdInputFixMaxPendingAgeMs.set_from_config(readInt("KcdInputFix", "MaxPendingAgeMs"));
+            KcdInputFixMaxPending.set_from_config(readInt("KcdInputFix", "MaxPending"));
+        }
+
         // Sharpness
         {
             SharpnessShader.set_from_config(readString("Sharpness", "Shader", true).transform(CodeToSharpnessShader));
@@ -1550,6 +1561,18 @@ bool Config::SaveIni()
                      wstring_to_string(Instance()->LogFileName.value_for_config_or(L"auto")).c_str());
         ini.SetValue("Log", "LogAsync", GetBoolValue(Instance()->LogAsync.value_for_config()).c_str());
         ini.SetValue("Log", "LogAsyncThreads", GetIntValue(Instance()->LogAsyncThreads.value_for_config()).c_str());
+    }
+
+    // Keyboard input fix (frame-dependent input sampling, e.g. Kingdom Come)
+    {
+        ini.SetValue("KcdInputFix", "Enabled", GetBoolValue(Instance()->KcdInputFixEnabled.value_for_config()).c_str());
+        ini.SetValue("KcdInputFix", "Mode", GetIntValue(Instance()->KcdInputFixMode.value_for_config()).c_str());
+        ini.SetValue("KcdInputFix", "PollHz", GetIntValue(Instance()->KcdInputFixPollHz.value_for_config()).c_str());
+        ini.SetValue("KcdInputFix", "DebounceMs", GetIntValue(Instance()->KcdInputFixDebounceMs.value_for_config()).c_str());
+        ini.SetValue("KcdInputFix", "HoldMs", GetIntValue(Instance()->KcdInputFixHoldMs.value_for_config()).c_str());
+        ini.SetValue("KcdInputFix", "MaxPendingAgeMs",
+                     GetIntValue(Instance()->KcdInputFixMaxPendingAgeMs.value_for_config()).c_str());
+        ini.SetValue("KcdInputFix", "MaxPending", GetIntValue(Instance()->KcdInputFixMaxPending.value_for_config()).c_str());
     }
 
     // NvApi

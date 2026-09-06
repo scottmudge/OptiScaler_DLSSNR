@@ -423,4 +423,38 @@ These can be changed from the in-game menu with real-time results.
 
 ![menu scale](images/ui_scale.png)
 
+### Keyboard Input Fix
+
+Some games sample keyboard input once per rendered frame via DirectInput. When a key
+is tapped quickly (or the frame pacing is irregular), the down can fall entirely
+between two polls and the press is lost, or it can be registered twice. Kingdom Come:
+Deliverance II is a known case. This is independent of frame generation; it is a
+property of how the game polls the device.
+
+`KcdInputFix` adds a high-frequency capture thread that watches the global keyboard
+state far faster than the game polls the device. When the game then reads the
+keyboard through DirectInput, any press it would otherwise miss is folded back into
+the reported state, so a dropped tap is still registered. It only touches a
+DirectInput keyboard device; the mouse and gamepads are unaffected. It is off by
+default and only active when OptiScaler has hooked the game's DirectInput.
+
+```ini
+[KcdInputFix]
+; Master switch. true or false - default false
+Enabled=false
+; Capture method: 0 = poll (high-rate GetAsyncKeyState thread), 1 = hook
+; (global WH_KEYBOARD_LL, event driven, no polling latency). Default 0.
+Mode=0
+; Polling rate in Hz (poll mode only). Higher catches faster taps (default 500).
+PollHz=500
+; Per-key debounce window in ms to ignore contact bounce (default 30).
+DebounceMs=30
+; Keep a held key marked down for this many ms after a poll (default 0 = off).
+HoldMs=0
+; Drop captured presses older than this many ms (default 300).
+MaxPendingAgeMs=300
+; Upper bound on the number of presses waiting in the queue (default 1024).
+MaxPending=1024
+```
+
 

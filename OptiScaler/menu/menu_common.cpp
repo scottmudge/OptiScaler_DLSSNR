@@ -6717,6 +6717,58 @@ void MenuCommon::RenderFpsOverlaySettings(RenderMenuContext& ctx)
     }
 }
 
+void MenuCommon::RenderInputFixSettings(RenderMenuContext& ctx)
+{
+    auto config = ctx.config;
+
+    // KEYBOARD INPUT FIX -----------------------------
+    ImGui::Spacing();
+    if (auto ch = ScopedCollapsingHeader("Keyboard Input Fix"); ch.IsHeaderOpen())
+    {
+        ScopedIndent indent {};
+        ImGui::Spacing();
+
+        bool enabled = config->KcdInputFixEnabled.value_or_default();
+        if (ImGui::Checkbox("Enable input fix", &enabled))
+            config->KcdInputFixEnabled = enabled;
+
+        ImGui::TextDisabled(
+            "Replays keyboard taps that the game's once-per-frame DirectInput poll "
+            "would otherwise drop (e.g. Kingdom Come: Deliverance II).");
+
+        ImGui::BeginDisabled(!enabled);
+
+        int mode = config->KcdInputFixMode.value_or_default();
+        if (ImGui::RadioButton("Capture: Poll (GetAsyncKeyState)", mode == 0))
+            config->KcdInputFixMode = 0;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Capture: Hook (WH_KEYBOARD_LL)", mode == 1))
+            config->KcdInputFixMode = 1;
+
+        int pollHz = config->KcdInputFixPollHz.value_or_default();
+        if (ImGui::SliderInt("Poll rate (Hz)", &pollHz, 60, 1000))
+            config->KcdInputFixPollHz = pollHz;
+
+        int debounceMs = config->KcdInputFixDebounceMs.value_or_default();
+        if (ImGui::SliderInt("Debounce (ms)", &debounceMs, 0, 200))
+            config->KcdInputFixDebounceMs = debounceMs;
+
+        int holdMs = config->KcdInputFixHoldMs.value_or_default();
+        if (ImGui::SliderInt("Hold (ms)", &holdMs, 0, 500))
+            config->KcdInputFixHoldMs = holdMs;
+
+        int maxAgeMs = config->KcdInputFixMaxPendingAgeMs.value_or_default();
+        if (ImGui::SliderInt("Max pending age (ms)", &maxAgeMs, 50, 2000))
+            config->KcdInputFixMaxPendingAgeMs = maxAgeMs;
+
+        int maxPending = config->KcdInputFixMaxPending.value_or_default();
+        if (ImGui::SliderInt("Max pending", &maxPending, 1, 4096))
+            config->KcdInputFixMaxPending = maxPending;
+
+        ImGui::EndDisabled();
+    }
+}
+
 void MenuCommon::RenderUpscalerInputsSettings(RenderMenuContext& ctx)
 {
     auto config = ctx.config;
@@ -7122,6 +7174,7 @@ void MenuCommon::RenderMainMenuTable(RenderMenuContext& ctx)
         RenderThemeSettings(ctx);
         RenderFpsOverlaySettings(ctx);
         RenderUpscalerInputsSettings(ctx);
+        RenderInputFixSettings(ctx);
         RenderApiAndTextureSettings(ctx);
         RenderKeybindSettings(ctx);
 

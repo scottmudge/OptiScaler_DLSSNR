@@ -899,6 +899,26 @@ class Config
     CustomOptional<bool, NoDefault> ForceVsync;
     CustomOptional<UINT> VsyncInterval { 0 };
 
+    // --- Keyboard input fix (frame-dependent input sampling, e.g. Kingdom Come:
+    // --- Deliverance II). Off by default. See menu/input/kcd_input_fix.*.
+    CustomOptional<bool> KcdInputFixEnabled { false };
+    // Capture method. 0 = poll (high-rate GetAsyncKeyState thread), 1 = hook
+    // (global WH_KEYBOARD_LL, event driven, no polling latency).
+    CustomOptional<int> KcdInputFixMode { 0 };
+    // Capture rate for the high-frequency GetAsyncKeyState polling thread (poll mode).
+    CustomOptional<int> KcdInputFixPollHz { 500 };
+    // Per-key debounce: ignore re-detections of the same key within this window so a
+    // contact bounce is not replayed twice.
+    CustomOptional<int> KcdInputFixDebounceMs { 30 };
+    // Keep a held key marked down for this many ms after the game polls, so a key
+    // still physically pressed is not lost between irregular samples. 0 disables.
+    CustomOptional<int> KcdInputFixHoldMs { 0 };
+    // Drop captured presses older than this (a tap left in the queue too long is
+    // stale and replaying it would feel wrong).
+    CustomOptional<int> KcdInputFixMaxPendingAgeMs { 300 };
+    // Upper bound on how many presses may wait in the queue.
+    CustomOptional<int> KcdInputFixMaxPending { 1024 };
+
     // Old configs for compat reasons
     CustomOptional<bool, NoDefault> _DONTUSE_Fsr4ForceEnableInt8;
 

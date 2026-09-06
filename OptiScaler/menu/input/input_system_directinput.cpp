@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "input_system_internal.h"
+#include "kcd_input_fix.h"
 
 #include <detours/detours.h>
 
@@ -390,6 +391,8 @@ bool HookDirectInputDeviceLocked(void* device, DirectInputDeviceKind kind)
     if (!attachRelease && !attachGetDeviceState && !attachGetDeviceData)
     {
         TrackDirectInputDeviceLocked(device, kind);
+        if (kind == DirectInputDeviceKind::Keyboard)
+            KcdInputFix::Update();
         return completeCoverage;
     }
 
@@ -439,6 +442,8 @@ bool HookDirectInputDeviceLocked(void* device, DirectInputDeviceKind kind)
                  reinterpret_cast<void*>(getDeviceData), device);
 
     TrackDirectInputDeviceLocked(device, kind);
+    if (kind == DirectInputDeviceKind::Keyboard)
+        KcdInputFix::Update();
     return completeCoverage;
 }
 
@@ -626,6 +631,10 @@ void UpdateDirectInputIntegrationLocked()
 
 bool RemoveDirectInputHooksLocked()
 {
+    // Tear down the keyboard input-fix capture thread whenever the DirectInput hooks
+    // go away (this only happens on shutdown). Idempotent; returns fast if not running.
+    KcdInputFix::Stop();
+
     if (!_state.DirectInput8CreateHookInstalled && !_state.DirectInputCreateAHookInstalled &&
         !_state.DirectInputCreateWHookInstalled && !_state.DirectInputCreateExHookInstalled &&
         !_state.DirectInputCreateDeviceAHookInstalled && !_state.DirectInputCreateDeviceWHookInstalled &&
@@ -898,10 +907,11 @@ HRESULT WINAPI hkDirectInputCreateDeviceW(void* directInput, REFGUID guid, void*
 HRESULT WINAPI hkDirectInputGetDeviceState(void* device, DWORD dataSize, LPVOID data)
 {
     DirectInputGetDeviceState_t original = nullptr;
+    DirectInputDeviceKind kind = DirectInputDeviceKind::Other;
 
     {
         std::unique_lock lock(_state.Mutex);
-        const DirectInputDeviceKind kind = GetDirectInputDeviceKindLocked(device);
+        kind = GetDirectInputDeviceKindLocked(device);
         _state.DirectInputGetDeviceStateCallCount++;
 
         if (ShouldBlockDirectInputDeviceLocked(kind))
@@ -929,7 +939,14 @@ HRESULT WINAPI hkDirectInputGetDeviceState(void* device, DWORD dataSize, LPVOID 
         return DIERR_GENERIC;
 
     ScopedHookBypass bypass;
-    return original(device, dataSize, data);
+    const HRESULT result = original(device, dataSize, data);
+
+    // Keyboard input fix: fold in any press the high-rate capture saw that the
+    // game's once-per-frame poll would otherwise miss.
+    if (SUCCEEDED(result) && kind == DirectInputDeviceKind::Keyboard)
+        KcdInputFix::ApplyPendingToLevelState(reinterpret_cast<BYTE*>(data));
+
+    return result;
 }
 
 HRESULT WINAPI hkDirectInputGetDeviceData(void* device, DWORD objectDataSize, LPDIDEVICEOBJECTDATA data, LPDWORD inOut,
@@ -968,7 +985,20 @@ HRESULT WINAPI hkDirectInputGetDeviceData(void* device, DWORD objectDataSize, LP
             return DIERR_GENERIC;
 
         ScopedHookBypass bypass;
-        return original(device, objectDataSize, data, inOut, flags);
+        const HRESULT result = original(device, objectDataSize, data, inOut, flags);
+
+        // Keyboard input fix: fold pending presses into the buffered event queue so
+        // a tap the game would otherwise miss between polls still reaches it.
+        if (SUCCEEDED(result) && kind == DirectInputDeviceKind::Keyboard && data != nullptr && inOut != nullptr)
+        {
+            const int count = (int)(*inOut);
+            const int capacity = (objectDataSize != 0) ? (int)(objectDataSize / sizeof(DIDEVICEOBJECTDATA)) : count;
+            const int added = KcdInputFix::ApplyPendingToEventBuffer(data, capacity, count);
+            if (added > 0)
+                *inOut = (DWORD)(count + added);
+        }
+
+        return result;
     }
 
     // GetDeviceData is backed by a buffered event queue. Returning zero without

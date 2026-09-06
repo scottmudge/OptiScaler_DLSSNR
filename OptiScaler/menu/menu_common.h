@@ -176,6 +176,7 @@ class MenuCommon
     static void RenderThemeSettings(RenderMenuContext& ctx);
     static void RenderFpsOverlaySettings(RenderMenuContext& ctx);
     static void RenderUpscalerInputsSettings(RenderMenuContext& ctx);
+    static void RenderInputFixSettings(RenderMenuContext& ctx);
     static void RenderApiAndTextureSettings(RenderMenuContext& ctx);
     static void RenderKeybindSettings(RenderMenuContext& ctx);
     static void RenderMainMenuGraphs(RenderMenuContext& ctx);

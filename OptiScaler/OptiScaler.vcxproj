@@ -352,6 +352,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\magnifier\Magnifier_Dx11.h" />
     <ClInclude Include="menu\input\input_system.h" />
     <ClInclude Include="menu\input\input_system_internal.h" />
+    <ClInclude Include="menu\input\kcd_input_fix.h" />
     <ClInclude Include="framegen\nvngx\Nvngx_FFX.h" />
     <ClInclude Include="framegen\nvngx\Nvngx_Nukems.h" />
     <ClInclude Include="framegen\nvngx\Nvngx_DllProxy.h" />
@@ -651,6 +652,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="menu\input\input_system_window.cpp" />
     <ClCompile Include="menu\input\input_system_windows_hooks.cpp" />
     <ClCompile Include="menu\input\input_system_xinput.cpp" />
+    <ClCompile Include="menu\input\kcd_input_fix.cpp" />
     <ClCompile Include="misc\IdentifyGpu.cpp" />
     <ClCompile Include="inputs\FSR2_Dx11.cpp" />
     <ClCompile Include="inputs\FSR2_Vk.cpp" />
