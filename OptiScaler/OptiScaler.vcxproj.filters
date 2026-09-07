@@ -962,6 +962,12 @@
     <ClInclude Include="dlssnr\DlssNrFeature_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="dlssnr\DlssNr_ExposureScan.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\dlss\DLSSFeature_VkOn12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Config.cpp">
@@ -1563,6 +1569,15 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="dlssnr\DlssNr_Menu.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="upscalers\dlss\DLSSFeature_Dx11On12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="upscalers\dlss\DLSSFeature_VkOn12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="dlssnr\DlssNr_ExposureScan.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
