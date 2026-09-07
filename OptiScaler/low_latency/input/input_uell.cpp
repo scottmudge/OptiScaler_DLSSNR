@@ -41,7 +41,7 @@ void InputUeLowLatency::tickStart(int64_t frameId, float DeltaSeconds, bool bIdl
     if (!inited)
         InputUeLowLatency::init();
 
-    auto result = InputCommon::sleep(inputContext, device, frameId);
+    auto result = InputCommon::sleep(inputContext, device, (uint32_t)frameId);
 
     if (result == InputResult::UsingDifferentInput)
         return;
