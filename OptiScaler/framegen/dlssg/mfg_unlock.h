@@ -48,4 +48,16 @@ bool IsApplied();
 // applied. Lets the caller re-read numFramesToGenerateMax so the MFG count
 // selector becomes available without a swapchain recreation.
 bool ConsumeJustApplied();
+
+// Live per-patch status for the UI so the user can confirm what actually landed.
+struct Status
+{
+    bool enabled = false;      // FGMfgUnlock opt-in is on
+    bool archGates = false;    // snippet arch gates rewritten (cap raised to 5)
+    bool temporal = false;     // midpoint fatbin rebuilt + descriptors repointed
+    bool flipMeter = false;    // plugin flip-metering pinned (software RSYNC pacing)
+    bool ceiling = false;      // plugin frame ceiling stopped
+    int maxGenerated = 1;      // 5 generated frames (6x) once arch gates land, else 1 (2x)
+};
+Status GetStatus();
 }

@@ -17,6 +17,7 @@
 #include <proxies/Streamline_Proxy.h>
 
 #include <framegen/nvngx/Nvngx_FG.h>
+#include <framegen/dlssg/mfg_unlock.h>
 
 #include <nvapi/fakenvapi.h>
 #include <hooks/Reflex_Hooks.h>
@@ -4223,6 +4224,40 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                       "NGX capability is read when frame generation first initializes, so enabling "
                       "it in-game may require restarting FG (or the game). The MFG count selector "
                       "appears once applied.");
+
+        {
+            const auto mfg = MfgUnlock::GetStatus();
+            const std::string mfgDetail = std::format(
+                "In-memory patches:\n"
+                "  arch gates (cap -> {}x): {}\n"
+                "  midpoint / temporal fix: {}\n"
+                "  software pacing (flip metering off): {}\n"
+                "  frame ceiling: {}\n"
+                "Set [DLSSG] MfgUnlock=true in OptiScaler.ini before starting for a clean unlock.",
+                mfg.maxGenerated + 1, mfg.archGates ? "patched" : "not patched",
+                mfg.temporal ? "patched" : "not patched",
+                mfg.flipMeter ? "patched" : "not patched",
+                mfg.ceiling ? "patched" : "not patched");
+            if (!mfg.enabled)
+            {
+                ImGui::TextColored(toneMapColor(ImVec4(0.6f, 0.6f, 0.6f, 1.f)), "MFG unlock: off");
+            }
+            else if (!mfg.archGates)
+            {
+                ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.85f, 0.2f, 1.f)),
+                                   "MFG unlock: pending - start frame generation (or restart) to apply");
+            }
+            else
+            {
+                const int now = state.dlssgDetectedInterpolationCount > 0
+                                    ? state.dlssgDetectedInterpolationCount + 1
+                                    : 2;
+                ImGui::TextColored(toneMapColor(ImVec4(0.f, 1.f, 0.25f, 1.f)),
+                                   std::format("MFG unlock: active - up to {}x ({}x now)",
+                                               mfg.maxGenerated + 1, now).c_str());
+            }
+            ImGui::SetTooltip("%s", mfgDetail.c_str());
+        }
 
         auto maxInterpolationCount = fgOutput->GetMaxInterpolationCount();
 

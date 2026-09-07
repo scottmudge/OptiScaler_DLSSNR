@@ -148,6 +148,9 @@ std::atomic<bool> g_justApplied{false};
 bool g_snippetPatched = false;
 bool g_pluginPatched = false;
 bool g_archGatesOk = false;
+bool g_temporalOk = false;
+bool g_flipMeterOk = false;
+bool g_ceilingOk = false;
 void* g_midpointAlloc = nullptr;
 std::vector<CodePatch> g_codePatches;
 std::vector<PointerPatch> g_pointerPatches;
@@ -865,22 +868,23 @@ void Apply()
         // The arch gate is the actual enable; the midpoint fix is quality. Track
         // the gate separately so g_applied reflects whether MFG is usable.
         g_archGatesOk = PatchNgxArchGates(snippet);
-        PatchNgxMidpoint(snippet);
+        g_temporalOk = PatchNgxMidpoint(snippet);
         if (g_archGatesOk)
         {
             g_applied.store(true, std::memory_order_release);
             // Arch gate just raised the advertised max; let the caller re-read
             // numFramesToGenerateMax so the MFG count selector appears.
             g_justApplied.store(true, std::memory_order_release);
-            LOG_INFO("MfgUnlock: arch gates + temporal patch landed in nvngx_dlssg.dll; MFG cap raised");
+            LOG_INFO("MfgUnlock: arch gates landed in nvngx_dlssg.dll; MFG cap raised to 5 (temporal {})",
+                     g_temporalOk ? "patched" : "skipped");
         }
     }
 
     if (plugin != nullptr && !g_pluginPatched)
     {
         g_pluginPatched = true;
-        PatchSlFlipMetering(plugin); // pacing is critical for 3x+; logs its outcome
-        PatchSlFrameCeiling(plugin);
+        g_flipMeterOk = PatchSlFlipMetering(plugin); // pacing is critical for 3x+; logs its outcome
+        g_ceilingOk = PatchSlFrameCeiling(plugin);
     }
 }
 
@@ -896,6 +900,9 @@ void Restore()
     g_snippetPatched = false;
     g_pluginPatched = false;
     g_archGatesOk = false;
+    g_temporalOk = false;
+    g_flipMeterOk = false;
+    g_ceilingOk = false;
     g_applied.store(false, std::memory_order_release);
     g_justApplied.store(false, std::memory_order_release);
 }
@@ -908,6 +915,18 @@ bool IsApplied()
 bool ConsumeJustApplied()
 {
     return g_justApplied.exchange(false, std::memory_order_acq_rel);
+}
+
+Status GetStatus()
+{
+    Status s;
+    s.enabled = MfgUnlockEnabled();
+    s.archGates = g_archGatesOk;
+    s.temporal = g_temporalOk;
+    s.flipMeter = g_flipMeterOk;
+    s.ceiling = g_ceilingOk;
+    s.maxGenerated = g_archGatesOk ? 5 : 1;
+    return s;
 }
 
 } // namespace MfgUnlock
