@@ -4210,6 +4210,17 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
 
         ShowHelpMarker("Enable Frame Generation");
 
+        bool mfgUnlock = config->FGMfgUnlock.value_or_default();
+        if (ImGui::Checkbox("MFG unlock (RTX 40: 3x-6x)##mfgunlock", &mfgUnlock))
+        {
+            config->FGMfgUnlock = mfgUnlock;
+            LOG_DEBUG("FGMfgUnlock set: {}", mfgUnlock);
+            state.fgChanged = true;
+        }
+        ShowHelpMarker("Unlocks DLSS multi-frame generation above 2x on RTX 40 by patching the "
+                      "bundled nvngx_dlssg.dll / sl.dlss_g.dll in memory (arch gates, temporal "
+                      "fix, software pacing). The MFG count selector appears once applied.");
+
         auto maxInterpolationCount = fgOutput->GetMaxInterpolationCount();
 
         if (maxInterpolationCount > 1)

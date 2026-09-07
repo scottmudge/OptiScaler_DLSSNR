@@ -855,6 +855,11 @@ class Config
     CustomOptional<bool> FGDLSSGOverrideForceDMFG { false };   // Overrides game's DLSSG mode to Dynamic
     CustomOptional<bool> FGDLSSGForceDMFG { false };           // Overrides Opti's DLSSG mode to Dynamic
     CustomOptional<float> FGDLSSGFramerateTargetDMFG { 0.0f }; // 0.0 means auto-detects the display refresh rate
+    // Unlocks DLSS multi-frame generation above 2x (3x-6x) on Ada (RTX 40) by
+    // patching the bundled nvngx_dlssg.dll / sl.dlss_g.dll in process memory
+    // (arch gates + temporal fix + software flip-metering pacing + frame ceiling).
+    // Off by default so the standard 2x path is untouched. See framegen/dlssg/mfg_unlock.*.
+    CustomOptional<bool> FGMfgUnlock { false };
 
     // As per
     // https://github.com/artur-graniszewski/dlss-enabler-main/blob/a92464d468eb0d91ae17befa66c6bf6229f20b9f/Utils/DlssgProxy.cpp#L1033

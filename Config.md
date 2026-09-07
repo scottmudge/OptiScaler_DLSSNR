@@ -449,12 +449,42 @@ Mode=0
 PollHz=500
 ; Per-key debounce window in ms to ignore contact bounce (default 30).
 DebounceMs=30
-; Keep a held key marked down for this many ms after a poll (default 0 = off).
-HoldMs=0
-; Drop captured presses older than this many ms (default 300).
-MaxPendingAgeMs=300
-; Upper bound on the number of presses waiting in the queue (default 1024).
-MaxPending=1024
+ ; Keep a held key marked down for this many ms after a poll (default 0 = off).
+ HoldMs=0
+ ; Drop captured presses older than this many ms (default 300).
+ MaxPendingAgeMs=300
+ ; Upper bound on the number of presses waiting in the queue (default 1024).
+ MaxPending=1024
+```
+
+### Frame Generation (DLSSG)
+
+`MfgUnlock` unlocks DLSS multi-frame generation above 2X (up to 6X) on RTX 40 (Ada).
+NVIDIA ships the DLSS-G NGX snippet gated to a single generated frame on Ada; this
+option lifts that limit by patching the `nvngx_dlssg.dll` and `sl.dlss_g.dll` that
+OptiScaler bundles itself, entirely in process memory. Four things are patched so the
+extra frames actually look right and stay smooth:
+
+* **Architecture gates** – the `cmp …, 0x1B0` checks in `nvngx_dlssg.dll` that cap the
+  generated-frame count on Ada are neutralised, so the snippet reports a max of five
+  generated frames (6X total).
+* **Temporal / midpoint fix** – the motion-interpolation kernel's "midpoint" weights are
+  rebuilt so the generated frames sit correctly between the real frames instead of all
+  landing at the same instant.
+* **Software flip-metering pacing** – the Streamline plugin's hardware-present
+  accounting is replaced with a software counter, which is what keeps 3X–6X from
+  stalling the frame loop (the reference unlocks ship this).
+* **Frame ceiling** – the plugin's clamp that would lower the advertised max back down
+  to a stale cached value is disabled.
+
+Everything is reverted on shutdown. It only takes effect when the DLSSG output is in
+use and does not touch the standard 2X path. Off by default.
+
+```ini
+[DLSSG]
+ ; Unlocks DLSS multi-frame generation above 2X (up to 6X) on RTX 40 (Ada).
+ ; true or false - default false
+ MfgUnlock=false
 ```
 
 

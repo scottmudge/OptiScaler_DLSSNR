@@ -9,6 +9,8 @@
 #include <hooks/Reflex_Hooks.h>
 #include <hooks/DxgiFactory_Hooks.h>
 
+#include <framegen/dlssg/mfg_unlock.h>
+
 #include <magic_enum.hpp>
 
 #include <DirectXMath.h>
@@ -83,6 +85,10 @@ bool DLSSG_Dx12::CreateSwapchain(IDXGIFactory* factory, ID3D12CommandQueue* cmdQ
             return false;
         }
     }
+
+    // Land the MFG unlock (arch gates + pacing) before reading numFramesToGenerateMax
+    // below, so the unlocked cap (up to 5) is what we advertise, not the stale 1.
+    MfgUnlock::Apply();
 
     _width = desc->BufferDesc.Width;
     _height = desc->BufferDesc.Height;
@@ -188,6 +194,9 @@ bool DLSSG_Dx12::CreateSwapchain1(IDXGIFactory* factory, ID3D12CommandQueue* cmd
         }
     }
 
+    // Land the MFG unlock before reading numFramesToGenerateMax below.
+    MfgUnlock::Apply();
+
     _width = desc->Width;
     _height = desc->Height;
 
@@ -278,6 +287,8 @@ void DLSSG_Dx12::Deactivate()
 
     if (_isActive)
     {
+        State::Instance().dlssgDetectedInterpolationCount = 0;
+
         sl::DLSSGOptions options {};
         options.mode = sl::DLSSGMode::eOff;
         options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
@@ -303,6 +314,9 @@ bool DLSSG_Dx12::Shutdown()
     MenuOverlayDx::CleanupRenderTarget(true, NULL);
 
     DestroyFGContext();
+
+    // Revert the in-memory MFG patches before Streamline and the modules go away.
+    MfgUnlock::Restore();
 
     if (State::Instance().isShuttingDown)
         StreamlineProxy::Shutdown()();
@@ -354,6 +368,12 @@ bool DLSSG_Dx12::Dispatch()
     options.mode = sl::DLSSGMode::eOn;
     options.numFramesToGenerate = _framesToInterpolate;
     options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
+
+    // When OptiScaler drives the DLSSG output itself (rather than the game), the
+    // "detected" frame count is never set by a game NGX evaluate, so the UI would
+    // report "DLSSG off" even though frames are generated. Reflect the count we are
+    // actually requesting so the status reads "ON Nx".
+    State::Instance().dlssgDetectedInterpolationCount = _framesToInterpolate > 0 ? _framesToInterpolate : 0;
 
     if (Config::Instance()->FGDLSSGForceDMFG.value_or_default())
     {
@@ -572,6 +592,26 @@ void DLSSG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
     // If needed hooks are missing or XeFG proxy is not inited or FG swapchain is not created
     if (!StreamlineProxy::LoadStreamline() || state.currentFGSwapchain == nullptr)
         return;
+
+    // Safety net: apply the MFG unlock as soon as its modules are present. Idempotent
+    // and a cheap no-op once applied; guarantees the patch lands before the first
+    // active frame even if the CreateSwapchain path was not the one that ran.
+    MfgUnlock::EnsureApplied();
+
+    if (MfgUnlock::ConsumeJustApplied())
+    {
+        // The arch-gate patch just raised numFramesToGenerateMax; _maxInterpolationCount
+        // was cached (as 1) at swapchain creation, so re-read it here. This makes the
+        // MFG count selector appear immediately, without a swapchain recreation.
+        sl::DLSSGState dlssgState {};
+        sl::DLSSGOptions dlssgOptions {};
+        if (StreamlineProxy::DLSSGGetState()(viewport, dlssgState, &dlssgOptions) == sl::Result::eOk)
+        {
+            _maxInterpolationCount = dlssgState.numFramesToGenerateMax;
+            _supportsDMFG = dlssgState.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+            LOG_INFO("MFG unlock applied; max generated frames now {}", _maxInterpolationCount);
+        }
+    }
 
     if (state.isShuttingDown)
     {
