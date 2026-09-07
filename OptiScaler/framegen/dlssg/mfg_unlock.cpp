@@ -827,8 +827,13 @@ bool PatchSlFrameCeiling(HMODULE mod)
 
 bool MfgUnlockEnabled()
 {
-    return Config::Instance()->FGMfgUnlock.value_or_default() &&
-           State::Instance().activeFgOutput == FGOutput::DLSSG;
+    // Gate on the user's opt-in only. The DLSSG module handles below are only
+    // non-null when OptiScaler has loaded its own Streamline / DLSSG stack, so an
+    // enabled flag with no loaded modules is a no-op. We deliberately do NOT also
+    // require activeFgOutput==DLSSG here: the arch gate must be patched as early
+    // as possible (before slInit builds the NGX feature), which can be before the
+    // FG output is marked active.
+    return Config::Instance()->FGMfgUnlock.value_or_default();
 }
 
 } // namespace
@@ -838,8 +843,6 @@ namespace MfgUnlock
 
 void Apply()
 {
-    if (g_applied.load(std::memory_order_acquire))
-        return;
     if (!MfgUnlockEnabled())
         return;
 
@@ -847,8 +850,15 @@ void Apply()
     HMODULE snippet = state->optiDLSSG != nullptr ? state->optiDLSSG : GetModuleHandleW(L"nvngx_dlssg.dll");
     HMODULE plugin = state->optiSlDLSSG != nullptr ? state->optiSlDLSSG : GetModuleHandleW(L"sl.dlss_g.dll");
     if (snippet == nullptr && plugin == nullptr)
-        return; // Streamline not loaded yet; EnsureApplied retries each frame
+        return; // DLSSG modules not loaded yet; the per-frame EnsureApplied retries
 
+    // Each module is patched independently and only once, so Apply() may be called
+    // at several points (LoadStreamline, InitWithD3D12, per frame) and simply
+    // applies whichever module is present but not yet patched. Ordering matters:
+    // nvngx_dlssg.dll is mapped before slInit builds the NGX feature, and the
+    // arch-gate result (MultiFrameCountMax / m_multiFrameSupported) is evaluated
+    // while that feature is created -- so the snippet has to be patched BEFORE
+    // slInit, while the plugin (sl.dlss_g.dll) is only available after it.
     if (snippet != nullptr && !g_snippetPatched)
     {
         g_snippetPatched = true;
@@ -856,6 +866,14 @@ void Apply()
         // the gate separately so g_applied reflects whether MFG is usable.
         g_archGatesOk = PatchNgxArchGates(snippet);
         PatchNgxMidpoint(snippet);
+        if (g_archGatesOk)
+        {
+            g_applied.store(true, std::memory_order_release);
+            // Arch gate just raised the advertised max; let the caller re-read
+            // numFramesToGenerateMax so the MFG count selector appears.
+            g_justApplied.store(true, std::memory_order_release);
+            LOG_INFO("MfgUnlock: arch gates + temporal patch landed in nvngx_dlssg.dll; MFG cap raised");
+        }
     }
 
     if (plugin != nullptr && !g_pluginPatched)
@@ -863,15 +881,6 @@ void Apply()
         g_pluginPatched = true;
         PatchSlFlipMetering(plugin); // pacing is critical for 3x+; logs its outcome
         PatchSlFrameCeiling(plugin);
-    }
-
-    // Usable once the arch gates are open (or we never had the snippet to patch).
-    if ((snippet == nullptr) || g_archGatesOk)
-    {
-        g_applied.store(true, std::memory_order_release);
-        g_justApplied.store(true, std::memory_order_release);
-        LOG_INFO("MfgUnlock: applied (snippet={}, plugin={}); MFG 3x-6x is now available for RTX 40",
-                 (void*) snippet, (void*) plugin);
     }
 }
 

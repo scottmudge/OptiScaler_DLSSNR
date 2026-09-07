@@ -8,6 +8,7 @@
 #include <proxies/Ntdll_Proxy.h>
 #include <proxies/KernelBase_Proxy.h>
 #include <hooks/Streamline_Hooks.h>
+#include <framegen/dlssg/mfg_unlock.h>
 
 #include <sl.h>
 #include <sl_pcl.h>
@@ -96,6 +97,11 @@ class StreamlineProxy
             State::Instance().optiSlCommon = NtdllProxy::LoadLibraryExW_Ldr(slCommonPath.c_str(), NULL, NULL);
             auto dlssgPath = localSlPath / L"nvngx_dlssg.dll"; // TODO: maybe some search?
             State::Instance().optiDLSSG = NtdllProxy::LoadLibraryExW_Ldr(dlssgPath.c_str(), NULL, NULL);
+
+            // MFG unlock: patch nvngx_dlssg.dll NOW, before slInit builds the NGX
+            // feature (which is when the arch gate -> MultiFrameCountMax /
+            // m_multiFrameSupported is evaluated and cached). No-op unless FGMfgUnlock.
+            MfgUnlock::Apply();
 
             return HookStreamline(_dll);
         }
@@ -367,6 +373,11 @@ class StreamlineProxy
             State::Instance().optiSlDLSSG = StreamlineProxy::HookStreamlineDLSSG();
             State::Instance().optiSlReflex = StreamlineProxy::HookStreamlineReflex();
             State::Instance().optiSlPCL = StreamlineProxy::HookStreamlinePCL();
+
+            // MFG unlock: sl.dlss_g.dll is now available (it loads during slInit),
+            // so patch its flip-metering pacing + frame ceiling. The snippet was
+            // already patched in LoadStreamline above. No-op unless FGMfgUnlock.
+            MfgUnlock::Apply();
 
             if (State::Instance().gameQuirks & GameQuirk::CreateSLOnThe2ndDevice)
             {

@@ -33,8 +33,10 @@ namespace MfgUnlock
 // edits make frame generation disappear entirely. Everything here is applied to
 // the mapped image and reverted on unload -- never to the file.
 //
-// Apply()/EnsureApplied() are idempotent and gated on [Config] FGMfgUnlock with
-// the active FG output being DLSSG. Restore() undoes every patch.
+// Apply()/EnsureApplied() are idempotent (each module is patched once) and gated
+// on [Config] FGMfgUnlock. They must be called early: the arch gate has to land
+// before slInit builds the NGX feature, while the plugin is only available after.
+// Restore() undoes every patch.
 void Apply();
 void EnsureApplied();
 void Restore();

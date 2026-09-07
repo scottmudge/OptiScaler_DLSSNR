@@ -86,9 +86,8 @@ bool DLSSG_Dx12::CreateSwapchain(IDXGIFactory* factory, ID3D12CommandQueue* cmdQ
         }
     }
 
-    // Land the MFG unlock (arch gates + pacing) before reading numFramesToGenerateMax
-    // below, so the unlocked cap (up to 5) is what we advertise, not the stale 1.
-    MfgUnlock::Apply();
+    // (MFG unlock is applied inside StreamlineProxy::LoadStreamline / InitWithD3D12,
+    // which InitWithD3D12 above drives; it must land before slInit.)
 
     _width = desc->BufferDesc.Width;
     _height = desc->BufferDesc.Height;
@@ -193,9 +192,6 @@ bool DLSSG_Dx12::CreateSwapchain1(IDXGIFactory* factory, ID3D12CommandQueue* cmd
             return false;
         }
     }
-
-    // Land the MFG unlock before reading numFramesToGenerateMax below.
-    MfgUnlock::Apply();
 
     _width = desc->Width;
     _height = desc->Height;

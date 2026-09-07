@@ -480,6 +480,11 @@ extra frames actually look right and stay smooth:
 Everything is reverted on shutdown. It only takes effect when the DLSSG output is in
 use and does not touch the standard 2X path. Off by default.
 
+The snippet's capability is read the first time frame generation initializes, so set
+`MfgUnlock=true` in this file **before starting the game** for a clean unlock. Enabling it
+in-game updates the setting (and persists it) but may require restarting frame generation
+or the game, since OptiScaler does not cleanly re-initialise the NGX stack at runtime.
+
 ```ini
 [DLSSG]
  ; Unlocks DLSS multi-frame generation above 2X (up to 6X) on RTX 40 (Ada).

@@ -4219,7 +4219,10 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
         }
         ShowHelpMarker("Unlocks DLSS multi-frame generation above 2x on RTX 40 by patching the "
                       "bundled nvngx_dlssg.dll / sl.dlss_g.dll in memory (arch gates, temporal "
-                      "fix, software pacing). The MFG count selector appears once applied.");
+                      "fix, software pacing). Best set via OptiScaler.ini before starting; the "
+                      "NGX capability is read when frame generation first initializes, so enabling "
+                      "it in-game may require restarting FG (or the game). The MFG count selector "
+                      "appears once applied.");
 
         auto maxInterpolationCount = fgOutput->GetMaxInterpolationCount();
 
