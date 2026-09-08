@@ -418,7 +418,13 @@ bool DLSSG_Dx12::Dispatch()
     }
 
     sl::ReflexOptions reflexConst = {};
-    reflexConst.mode = sl::ReflexMode::eLowLatency;
+    // Request the lowest-latency Reflex mode ("ultra" / boost), not just eLowLatency. The
+    // boost mode tells the driver to hold the GPU at boost clocks while a frame is in flight,
+    // which is the main remaining input-latency lever on top of frame generation. It is fully
+    // compatible with DLSS Frame Generation (only eOff causes the pink screen). If the extra
+    // power draw / GPU-boost behaviour is ever undesirable this is the line to drop back to
+    // sl::ReflexMode::eLowLatency.
+    reflexConst.mode = sl::ReflexMode::eLowLatencyWithBoost;
     reflexConst.useMarkersToOptimize = ReflexHooks::gameIsSendingMarkers();
 
     auto reflexSetOptionsResult = StreamlineProxy::ReflexSetOptions()(reflexConst);
