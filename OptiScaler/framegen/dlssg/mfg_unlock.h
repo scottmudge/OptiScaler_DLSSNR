@@ -28,6 +28,11 @@ namespace MfgUnlock
 //      software pacer for smooth, low-latency output.
 //   4. Frame ceiling (sl.dlss_g.dll): stop the plugin from clamping its compiled
 //      maximum to a stale cached NGX device value (cmovb edx,ecx -> cmovb edx,edx).
+//   5. DRS clamp (sl.dlss_g.dll): the plugin also takes the minimum against the
+//      NVIDIA App's DRS "max generated frames" key (0x104D6667). On a stock
+//      machine it reads 0 and drops out, but a driver profile can set it (e.g. 1)
+//      and silently cap MFG at 2x. The guard that skips the clamp is made
+//      unconditional so the profile can no longer limit the count.
 //
 // NGX verifies the snippet's Authenticode signature at load time, so on-disk
 // edits make frame generation disappear entirely. Everything here is applied to
@@ -57,6 +62,7 @@ struct Status
     bool temporal = false;     // midpoint fatbin rebuilt + descriptors repointed
     bool flipMeter = false;    // plugin flip-metering pinned (software RSYNC pacing)
     bool ceiling = false;      // plugin frame ceiling stopped
+    bool drsClamp = false;     // DRS "max generated frames" clamp removed
     int maxGenerated = 1;      // 5 generated frames (6x) once arch gates land, else 1 (2x)
 };
 Status GetStatus();

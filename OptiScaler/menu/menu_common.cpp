@@ -4233,11 +4233,13 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                 "  midpoint / temporal fix: {}\n"
                 "  software pacing (flip metering off): {}\n"
                 "  frame ceiling: {}\n"
+                "  DRS max-frames clamp: {}\n"
                 "Set [DLSSG] MfgUnlock=true in OptiScaler.ini before starting for a clean unlock.",
                 mfg.maxGenerated + 1, mfg.archGates ? "patched" : "not patched",
                 mfg.temporal ? "patched" : "not patched",
                 mfg.flipMeter ? "patched" : "not patched",
-                mfg.ceiling ? "patched" : "not patched");
+                mfg.ceiling ? "patched" : "not patched",
+                mfg.drsClamp ? "removed" : "not removed");
             if (!mfg.enabled)
             {
                 ImGui::TextColored(toneMapColor(ImVec4(0.6f, 0.6f, 0.6f, 1.f)), "MFG unlock: off");
@@ -4256,7 +4258,8 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                                    std::format("MFG unlock: active - up to {}x ({}x now)",
                                                mfg.maxGenerated + 1, now).c_str());
             }
-            ImGui::SetTooltip("%s", mfgDetail.c_str());
+            ShowHelpMarker(mfgDetail.c_str());
+            // ImGui::SetTooltip("%s", mfgDetail.c_str());
         }
 
         auto maxInterpolationCount = fgOutput->GetMaxInterpolationCount();

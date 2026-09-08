@@ -151,6 +151,7 @@ bool g_archGatesOk = false;
 bool g_temporalOk = false;
 bool g_flipMeterOk = false;
 bool g_ceilingOk = false;
+bool g_drsClampOk = false;
 void* g_midpointAlloc = nullptr;
 std::vector<CodePatch> g_codePatches;
 std::vector<PointerPatch> g_pointerPatches;
@@ -828,6 +829,93 @@ bool PatchSlFrameCeiling(HMODULE mod)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// 5. DRS "max generated frames" clamp (sl.dlss_g.dll)
+// ---------------------------------------------------------------------------
+// The plugin computes the effective max as min(NGX MultiFrameCountMax, 5, DRS
+// key 0x104D6667). On a stock machine the DRS key reads 0 (absent) and drops
+// out, but the NVIDIA App can write it (here it was 1), which clamps the max to
+// 1 and silently caps MFG at 2x no matter what the app requests. The clamp is
+// the `je` that skips the `max = min(DRS, max)` sequence when the DRS value is
+// absent; making it unconditional keeps the DRS override from limiting us.
+//
+// Anchor: the unique 15-byte min-op that performs `max = min(DRS, max)`:
+//   41 8B 17   mov  edx,[r15]
+//   39 10      cmp  [rax],edx
+//   4C 0F 42 C0 cmovb r8,rax
+//   41 8B 00   mov  eax,[r8]
+//   41 89 07   mov  [r15],eax
+// The `je` that guards this block sits 21 bytes before it.
+bool PatchSlDrsClamp(HMODULE mod)
+{
+    uint8_t* base = nullptr;
+    IMAGE_NT_HEADERS64* nt = nullptr;
+    size_t image_size = 0;
+    if (!ModuleImage(mod, base, nt, image_size))
+        return false;
+
+    const uint8_t sig[15] = { 0x41, 0x8B, 0x17, 0x39, 0x10,
+                              0x4C, 0x0F, 0x42, 0xC0, 0x41,
+                              0x8B, 0x00, 0x41, 0x89, 0x07 };
+    const size_t sig_len = sizeof(sig);
+    const size_t je_offset = 21; // distance from the guarded je to the anchor
+
+    uint8_t* found = nullptr;
+    size_t hits = 0;
+    const auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
+    {
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0)
+            continue;
+        uint8_t* start = base + section->VirtualAddress;
+        const size_t size = section->Misc.VirtualSize;
+        if (size < je_offset + sig_len)
+            continue;
+        for (size_t off = je_offset; off + sig_len <= size; ++off)
+        {
+            if (std::memcmp(start + off, sig, sig_len) != 0)
+                continue;
+            if (found == nullptr)
+                found = start + off;
+            ++hits;
+        }
+    }
+
+    if (hits != 1 || found == nullptr)
+    {
+        LOG_WARN("MfgUnlock: found {} DRS max-clamp anchors in sl.dlss_g.dll (expected 1); leaving the "
+                 "DRS clamp alone", hits);
+        return false;
+    }
+
+    uint8_t* je = found - je_offset;
+    // The guard must be a near `je rel32` (0F 84 <disp32>), 6 bytes long.
+    if (je[0] != 0x0F || je[1] != 0x84)
+    {
+        LOG_WARN("MfgUnlock: the DRS clamp guard is not the expected `je rel32`; leaving it alone");
+        return false;
+    }
+    int32_t je_disp = 0;
+    std::memcpy(&je_disp, je + 2, sizeof(je_disp));
+    const int32_t target = static_cast<int32_t>(je - base) + 6 + je_disp;
+
+    // Rewrite the 6-byte `je` as an unconditional near `jmp rel32` (5 bytes) + NOP.
+    const int32_t jmp_disp = target - (static_cast<int32_t>(je - base) + 5);
+    uint8_t replacement[6];
+    replacement[0] = 0xE9;
+    std::memcpy(replacement + 1, &jmp_disp, 4);
+    replacement[5] = 0x90;
+
+    if (WritePatch(je, replacement, sizeof(replacement)))
+    {
+        LOG_INFO("MfgUnlock: removed the DRS 'max generated frames' clamp in sl.dlss_g.dll (je->jmp); "
+                 "the driver profile can no longer cap MFG to 2x");
+        return true;
+    }
+    LOG_WARN("MfgUnlock: could not patch the DRS max-clamp guard");
+    return false;
+}
+
 bool MfgUnlockEnabled()
 {
     // Gate on the user's opt-in only. The DLSSG module handles below are only
@@ -885,6 +973,7 @@ void Apply()
         g_pluginPatched = true;
         g_flipMeterOk = PatchSlFlipMetering(plugin); // pacing is critical for 3x+; logs its outcome
         g_ceilingOk = PatchSlFrameCeiling(plugin);
+        g_drsClampOk = PatchSlDrsClamp(plugin);
     }
 }
 
@@ -903,6 +992,7 @@ void Restore()
     g_temporalOk = false;
     g_flipMeterOk = false;
     g_ceilingOk = false;
+    g_drsClampOk = false;
     g_applied.store(false, std::memory_order_release);
     g_justApplied.store(false, std::memory_order_release);
 }
@@ -925,6 +1015,7 @@ Status GetStatus()
     s.temporal = g_temporalOk;
     s.flipMeter = g_flipMeterOk;
     s.ceiling = g_ceilingOk;
+    s.drsClamp = g_drsClampOk;
     s.maxGenerated = g_archGatesOk ? 5 : 1;
     return s;
 }
