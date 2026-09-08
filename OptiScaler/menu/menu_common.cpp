@@ -4256,7 +4256,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                                    std::format("MFG unlock: active - up to {}x ({}x now)",
                                                mfg.maxGenerated + 1, now).c_str());
             }
-            ImGui::SetTooltip("%s", mfgDetail.c_str());
+            ShowHelpMarker(mfgDetail.c_str());
         }
 
         auto maxInterpolationCount = fgOutput->GetMaxInterpolationCount();
