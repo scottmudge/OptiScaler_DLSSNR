@@ -154,8 +154,9 @@ using PFN_NrCreate = void*(__cdecl*) (const wchar_t*, const wchar_t*, ID3D12Devi
                                       float, int, float, float, float, int, int);
 using PFN_NrEvaluate = int(__cdecl*) (ID3D12GraphicsCommandList*, void*, void*, ID3D12Resource*,
                                       ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, unsigned int,
-                                      unsigned int, unsigned int, unsigned int, int, int, float, int,
-                                      float, float, float, int, float, float);
+                                      unsigned int, unsigned int, unsigned int, unsigned int, unsigned int,
+                                      unsigned int, unsigned int, unsigned int, unsigned int, int, int, float,
+                                      int, float, float, float, int, float, float);
 using PFN_NrRelease = void(__cdecl*) (void*);
 using PFN_NrSetExtras = void(__cdecl*) (void*, float, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*,
                                         unsigned int, unsigned int, unsigned int, unsigned int);
@@ -1538,6 +1539,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // one less thing a call site can get wrong, and the model takes the difference as a subrect per
     // resource rather than needing anything resampled.
     const D3D12_RESOURCE_DESC guideDesc = depth->GetDesc();
+    const D3D12_RESOURCE_DESC motionDesc = motion->GetDesc();
     unsigned int guideWidth = (unsigned int) guideDesc.Width;
     unsigned int guideHeight = guideDesc.Height;
 
@@ -1579,6 +1581,19 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         guideWidth = subW;
         guideHeight = subH;
     }
+
+    const unsigned int depthBaseX = std::min(frame.DepthSubrectBaseX, (unsigned int) guideDesc.Width);
+    const unsigned int depthBaseY = std::min(frame.DepthSubrectBaseY, guideDesc.Height);
+    guideWidth = std::min(guideWidth, (unsigned int) guideDesc.Width - depthBaseX);
+    guideHeight = std::min(guideHeight, guideDesc.Height - depthBaseY);
+
+    const unsigned int motionBaseX = std::min(frame.MotionSubrectBaseX, (unsigned int) motionDesc.Width);
+    const unsigned int motionBaseY = std::min(frame.MotionSubrectBaseY, motionDesc.Height);
+    const unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution ? guideWidth : width;
+    const unsigned int wantedMotionHeight = frame.MotionVectorsLowResolution ? guideHeight : height;
+    const unsigned int motionWidth =
+        std::min(wantedMotionWidth, (unsigned int) motionDesc.Width - motionBaseX);
+    const unsigned int motionHeight = std::min(wantedMotionHeight, motionDesc.Height - motionBaseY);
 
     g_nr.guideWidth = guideWidth;
     g_nr.guideHeight = guideHeight;
@@ -2149,7 +2164,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // The vectors were scaled to full-frame pixels; the image the model reprojects is the working size.
     // The vectors were scaled to full-frame pixels; the image the model reprojects is the
     // working size.
-    const float mvToWork = width != 0 ? (float) workWidth / (float) width : 1.0f;
+    const float mvToWorkX = width != 0 ? (float) workWidth / (float) width : 1.0f;
+    const float mvToWorkY = height != 0 ? (float) workHeight / (float) height : 1.0f;
 
     SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
 
@@ -2162,8 +2178,9 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     {
         const unsigned int proxyResult = DlssNr::Proxy::Run(
             cmdList, device, modelInput, depthIn, motionIn, g_nr.output, workWidth, workHeight,
-            guideWidth, guideHeight, g_nr.guideDepthInverted, g_nr.reset,
-            g_nr.guideMvScaleX * mvToWork, g_nr.guideMvScaleY * mvToWork);
+            guideWidth, guideHeight, motionWidth, motionHeight, depthBaseX, depthBaseY, motionBaseX,
+            motionBaseY, g_nr.guideDepthInverted, g_nr.reset,
+            g_nr.guideMvScaleX * mvToWorkX, g_nr.guideMvScaleY * mvToWorkY);
 
         g_nr.reset = false;
 
@@ -2187,12 +2204,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // feature-creation hang, and the colour core is not settled enough to build on. One evaluate.
     const int result = g_nr.evaluate(
         cmdList, g_nr.feature, g_nr.capabilityParams, modelInput, depthIn, motionIn, g_nr.output,
-        workWidth, workHeight, guideWidth, guideHeight, g_nr.guideDepthInverted ? 1 : 0,
-        g_nr.reset ? 1 : 0, cfg.DlssNrIntensity.value_or_default(),
+        workWidth, workHeight, guideWidth, guideHeight, motionWidth, motionHeight, depthBaseX,
+        depthBaseY, motionBaseX, motionBaseY, g_nr.guideDepthInverted ? 1 : 0, g_nr.reset ? 1 : 0,
+        cfg.DlssNrIntensity.value_or_default(),
         (int) cfg.DlssNrStyle.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(),
         cfg.DlssNrLocalTone.value_or_default(), cfg.DlssNrSkinStructure.value_or_default(),
-        cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, g_nr.guideMvScaleX * mvToWork,
-        g_nr.guideMvScaleY * mvToWork);
+        cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, g_nr.guideMvScaleX * mvToWorkX,
+        g_nr.guideMvScaleY * mvToWorkY);
 
     if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
@@ -2525,6 +2543,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     DlssNrFrameInfo frame {};
     frame.DepthInverted = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
     frame.ColourIsLinearHdr = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0;
+    frame.MotionVectorsLowResolution = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0;
 
     // The game telling the upscaler to forget everything it has accumulated: a cut, a teleport, a
     // load. Every upscaler in this tree reads it and this pass did not, so the model's history was
@@ -2544,6 +2563,10 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     // How much of the guides is real. See DlssNrFrameInfo -- zero means the game did not say.
     params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &frame.RenderSubrectWidth);
     params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &frame.RenderSubrectHeight);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &frame.DepthSubrectBaseX);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &frame.DepthSubrectBaseY);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, &frame.MotionSubrectBaseX);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, &frame.MotionSubrectBaseY);
 
     if (params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &frame.MvScaleX) != NVSDK_NGX_Result_Success)
         frame.MvScaleX = 1.0f;
