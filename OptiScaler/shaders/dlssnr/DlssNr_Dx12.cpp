@@ -2456,7 +2456,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         auto* queue = timingQueue != nullptr ? timingQueue
                                              : (ID3D12CommandQueue*) State::Instance().currentCommandQueue;
 
-        if (queue != nullptr)
+        // The readback exists for the performance display. Map/Unmap on a readback heap is a driver
+        // call on the game's thread every frame, so it runs only while the display is on screen; the
+        // queries themselves keep recording either way.
+        if (queue != nullptr && (cfg.ShowFps.value_or_default() || State::Instance().menuVisible))
         {
             if (auto ms = g_gpuTime->ReadGpuTime(queue); ms.has_value())
                 g_lastGpuTime = ms;
