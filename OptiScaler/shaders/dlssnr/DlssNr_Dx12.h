@@ -57,13 +57,43 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // encode and downsample would run with the resolve's parameters.
     ID3D12Resource* _constantBuffers[DLSSNR_NUM_OF_HEAPS] = {};
 
-    uint32_t _heapIndex = 0;
-
     // The shader reads five inputs and writes two, and not every mode uses all of them. Unused slots
     // still need a view bound -- an unbound descriptor is not an empty read, it is a read from
     // nothing -- so a stand-in is written into whichever are spare.
     static constexpr uint32_t kSrvCount = 5;
     static constexpr uint32_t kUavCount = 2;
+
+    // What each slot's descriptors and constants described last, so an unchanged binding is not
+    // re-created.
+    //
+    // A full-texture SRV/UAV is a pure function of its resource: the format, the size and the view
+    // shape all come from the resource's own description (Shader_Dx12::CreateShaderResourceView and
+    // CreateUnorderedAccessView read GetDesc and nothing else). A slot whose binding therefore has
+    // not moved since it last ran already holds exactly the bytes the GPU will read, and re-creating
+    // the view only costs a driver call and a write to GPU-visible memory. Steady state is the common
+    // case here -- the same few resources (the game's output, the private copies, the guide clones)
+    // bound in the same order every frame -- so the per-dispatch setup mostly falls away. A resource
+    // re-created for a new size or format is a new pointer or a new key and is written again; a
+    // pointer that reappears with the same size and format describes the same view it did before, so
+    // keeping the old bytes is exactly right.
+    struct BindKey
+    {
+        ID3D12Resource* res = nullptr;
+        UINT64 width = ~0ull;
+        UINT64 height = ~0ull;
+        UINT format = 0;
+
+        bool operator==(const BindKey& o) const
+        {
+            return res == o.res && width == o.width && height == o.height && format == o.format;
+        }
+    };
+
+    BindKey _srvKey[DLSSNR_NUM_OF_HEAPS][kSrvCount];
+    BindKey _uavKey[DLSSNR_NUM_OF_HEAPS][kUavCount];
+    uint8_t _cbKey[DLSSNR_NUM_OF_HEAPS][sizeof(DlssNrConstants)] = {};
+
+    uint32_t _heapIndex = 0;
 
     uint32_t _numThreadsX = 8;
     uint32_t _numThreadsY = 8;

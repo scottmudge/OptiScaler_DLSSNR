@@ -1438,6 +1438,12 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
     // Every slot in the table gets a view, whether the mode reads it or not. An unbound descriptor is
     // not an empty read; it is a read from nothing, and the source stands in wherever a mode has
     // nothing of its own to put there.
+    //
+    // Each view is created only when the resource it stands for moved. A view is a pure function of
+    // its resource (format, size and view shape all come from the resource's own description), and the
+    // key below covers the case the pointer alone does not: a released resource whose address the
+    // allocator hands back to a differently shaped one. Same pointer with the same size and format is
+    // the same view as before, so the slot's existing bytes stand.
     ID3D12Resource* const srvs[kSrvCount] = {
         InSource,
         InModel != nullptr ? InModel : InSource,
@@ -1447,7 +1453,16 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
     };
 
     for (uint32_t i = 0; i < kSrvCount; ++i)
+    {
+        const auto desc = srvs[i]->GetDesc();
+        const BindKey key { srvs[i], desc.Width, desc.Height, (UINT) desc.Format };
+
+        if (_srvKey[slot][i] == key)
+            continue;
+
         CreateShaderResourceView(_device, srvs[i], currentHeap.GetSrvCPU(i));
+        _srvKey[slot][i] = key;
+    }
 
     ID3D12Resource* const uavs[kUavCount] = {
         OutTarget,
@@ -1455,12 +1470,30 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
     };
 
     for (uint32_t i = 0; i < kUavCount; ++i)
-        CreateUnorderedAccessView(_device, uavs[i], currentHeap.GetUavCPU(i), 0);
-
-    if (!CreateConstantsBuffer(_device, _constantBuffers[slot], InConstants, currentHeap.GetCbvCPU(0)))
     {
-        LOG_ERROR("[{0}] Failed to create a constants buffer", _name);
-        return false;
+        const auto desc = uavs[i]->GetDesc();
+        const BindKey key { uavs[i], desc.Width, desc.Height, (UINT) desc.Format };
+
+        if (_uavKey[slot][i] == key)
+            continue;
+
+        CreateUnorderedAccessView(_device, uavs[i], currentHeap.GetUavCPU(i), 0);
+        _uavKey[slot][i] = key;
+    }
+
+    // The constants change with the frame (white point, sizes), but not every frame -- a steady scene
+    // at a steady resolution writes the same 256 bytes again and again, and Map/memcpy/Unmap on the
+    // upload heap is not free. The slot's own ring headroom already guarantees the GPU is done reading
+    // it, so comparing against what it holds and skipping the identical write is safe.
+    if (std::memcmp(_cbKey[slot], &InConstants, sizeof(InConstants)) != 0)
+    {
+        if (!CreateConstantsBuffer(_device, _constantBuffers[slot], InConstants, currentHeap.GetCbvCPU(0)))
+        {
+            LOG_ERROR("[{0}] Failed to create a constants buffer", _name);
+            return false;
+        }
+
+        std::memcpy(_cbKey[slot], &InConstants, sizeof(InConstants));
     }
 
     ID3D12DescriptorHeap* heaps[] = { currentHeap.GetHeapCSU() };
