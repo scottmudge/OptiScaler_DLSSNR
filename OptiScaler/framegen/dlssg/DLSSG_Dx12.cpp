@@ -308,6 +308,14 @@ void DLSSG_Dx12::Deactivate()
         reflexConst.useMarkersToOptimize = false;
         StreamlineProxy::ReflexSetOptions()(reflexConst);
 
+        // The cache mirrors what the plugin now holds (eOff), so the next Dispatch re-sends the
+        // active values instead of assuming they are still latched from before the deactivate.
+        _lastDlssgMode = sl::DLSSGMode::eOff;
+        _lastDlssgFrames = 0;
+        _lastDlssgDynamicTarget = 0.0f;
+        _lastReflexMode = sl::ReflexMode::eOff;
+        _lastReflexMarkers = false;
+
         _isActive = false;
     }
 }
@@ -389,6 +397,11 @@ bool DLSSG_Dx12::Dispatch()
         off.mode = sl::DLSSGMode::eOff;
         off.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
         StreamlineProxy::DLSSGSetOptions()(viewport, off);
+        // Mirror the plugin's new eOff state in the cache so the next Dispatch re-sends eOn at the
+        // new count (it would also differ on the count alone, but keep the cache authoritative).
+        _lastDlssgMode = sl::DLSSGMode::eOff;
+        _lastDlssgFrames = 0;
+        _lastDlssgDynamicTarget = 0.0f;
         LOG_INFO("DLSSG MFG count change: sent eOff to force a feature rebuild; next frame resumes eOn at the new count");
         return false;
     }
@@ -404,17 +417,31 @@ bool DLSSG_Dx12::Dispatch()
     // actually requesting so the status reads "ON Nx".
     State::Instance().dlssgDetectedInterpolationCount = _framesToInterpolate > 0 ? _framesToInterpolate : 0;
 
+    float dynamicTarget = 0.0f;
     if (Config::Instance()->FGDLSSGForceDMFG.value_or_default())
     {
         options.mode = sl::DLSSGMode::eDynamic;
-        options.dynamicTargetFrameRate = Config::Instance()->FGDLSSGFramerateTargetDMFG.value_or_default();
+        dynamicTarget = Config::Instance()->FGDLSSGFramerateTargetDMFG.value_or_default();
+        options.dynamicTargetFrameRate = dynamicTarget;
     }
 
-    auto dlssgSetOptionsResult = StreamlineProxy::DLSSGSetOptions()(viewport, options);
-
-    if (dlssgSetOptionsResult != sl::Result::eOk)
+    // The plugin latches these options (the count is only re-read on an eOff->eOn transition), so
+    // push them through the proxy only when they actually change. For a non-Streamline game the
+    // Reflex marker flag is always false, so after the first frame both option sets are static and
+    // this skips two proxy -> NvAPI calls every frame.
+    if (options.mode != _lastDlssgMode || options.numFramesToGenerate != _lastDlssgFrames ||
+        dynamicTarget != _lastDlssgDynamicTarget)
     {
-        LOG_ERROR("Couldn't set DLSSG options, error: {}", magic_enum::enum_name(dlssgSetOptionsResult));
+        auto dlssgSetOptionsResult = StreamlineProxy::DLSSGSetOptions()(viewport, options);
+
+        if (dlssgSetOptionsResult != sl::Result::eOk)
+        {
+            LOG_ERROR("Couldn't set DLSSG options, error: {}", magic_enum::enum_name(dlssgSetOptionsResult));
+        }
+
+        _lastDlssgMode = options.mode;
+        _lastDlssgFrames = options.numFramesToGenerate;
+        _lastDlssgDynamicTarget = dynamicTarget;
     }
 
     sl::ReflexOptions reflexConst = {};
@@ -427,11 +454,17 @@ bool DLSSG_Dx12::Dispatch()
     reflexConst.mode = sl::ReflexMode::eLowLatencyWithBoost;
     reflexConst.useMarkersToOptimize = ReflexHooks::gameIsSendingMarkers();
 
-    auto reflexSetOptionsResult = StreamlineProxy::ReflexSetOptions()(reflexConst);
-
-    if (reflexSetOptionsResult != sl::Result::eOk)
+    if (reflexConst.mode != _lastReflexMode || reflexConst.useMarkersToOptimize != _lastReflexMarkers)
     {
-        LOG_ERROR("Couldn't set Reflex options, error: {}", magic_enum::enum_name(reflexSetOptionsResult));
+        auto reflexSetOptionsResult = StreamlineProxy::ReflexSetOptions()(reflexConst);
+
+        if (reflexSetOptionsResult != sl::Result::eOk)
+        {
+            LOG_ERROR("Couldn't set Reflex options, error: {}", magic_enum::enum_name(reflexSetOptionsResult));
+        }
+
+        _lastReflexMode = reflexConst.mode;
+        _lastReflexMarkers = reflexConst.useMarkersToOptimize;
     }
 
     if (!_haveHudless.has_value())

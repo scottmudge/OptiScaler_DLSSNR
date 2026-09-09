@@ -25,6 +25,18 @@ class DLSSG_Dx12 : public virtual IFGFeature_Dx12
     ID3D12Fence* dlssgFence[BUFFER_COUNT] = {};
     UINT64 lastOptionFrame = 0;
 
+    // The DLSSG and Reflex options are latched by the SL plugin (see the _mfgReinitPending note
+    // above -- the count is only re-read on an eOff->eOn transition), so re-sending identical
+    // options every frame just costs two proxy -> NvAPI calls for nothing. Track the last-sent
+    // values and call the proxy only when one of them actually changes (activate, deactivate,
+    // MFG-rate change, or the game's marker flag flipping). Deactivate() and the _mfgReinitPending
+    // eOff frame update these so the next Dispatch re-sends the active values.
+    sl::DLSSGMode _lastDlssgMode = sl::DLSSGMode::eOff;
+    uint32_t _lastDlssgFrames = 0;
+    float _lastDlssgDynamicTarget = 0.0f;
+    sl::ReflexMode _lastReflexMode = sl::ReflexMode::eOff;
+    bool _lastReflexMarkers = false;
+
     bool Dispatch();
 
   protected:
