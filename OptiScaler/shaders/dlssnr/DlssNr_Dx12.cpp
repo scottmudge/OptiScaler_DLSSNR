@@ -1690,10 +1690,8 @@ bool EnsureDummyTemporal(ID3D12Device* device, ID3D12GraphicsCommandList* list, 
     const FLOAT motionZero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     // No descriptor and no rect list: the whole surface, which is the entire point of the fill.
-    list->ClearUnorderedAccessViewFloat((D3D12_GPU_DESCRIPTOR_HANDLE) nullptr, (D3D12_CPU_DESCRIPTOR_HANDLE) nullptr,
-                                        g_dummyDepth, depthOne, 0, nullptr);
-    list->ClearUnorderedAccessViewFloat((D3D12_GPU_DESCRIPTOR_HANDLE) nullptr, (D3D12_CPU_DESCRIPTOR_HANDLE) nullptr,
-                                        g_dummyMotion, motionZero, 0, nullptr);
+    list->ClearUnorderedAccessViewFloat({ (uint64_t) nullptr }, { (uint64_t) nullptr }, g_dummyDepth, depthOne, 0, nullptr);
+    list->ClearUnorderedAccessViewFloat({ (uint64_t) nullptr }, { (uint64_t) nullptr }, g_dummyMotion, motionZero, 0, nullptr);
 
     g_dummyWidth = width;
     g_dummyHeight = height;
