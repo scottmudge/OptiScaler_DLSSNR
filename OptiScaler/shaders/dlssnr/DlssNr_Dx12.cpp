@@ -1456,6 +1456,43 @@ void ReleasePresentTemporal()
     g_temporal.valid = false;
 }
 
+// A failure part-way through (a transient D3D error is the only kind that happens) must leave the
+// ring exactly as it found it, or every retry would leak the partial set it had made.
+void ResetPresentList()
+{
+    for (unsigned int i = 0; i < PresentList::kSlots; ++i)
+    {
+        if (g_presentList.list[i] != nullptr)
+        {
+            g_presentList.list[i]->Release();
+            g_presentList.list[i] = nullptr;
+        }
+
+        if (g_presentList.allocator[i] != nullptr)
+        {
+            g_presentList.allocator[i]->Release();
+            g_presentList.allocator[i] = nullptr;
+        }
+
+        g_presentList.fenceValue[i] = 0;
+        g_presentList.dirty[i] = false;
+    }
+
+    if (g_presentList.fence != nullptr)
+    {
+        g_presentList.fence->Release();
+        g_presentList.fence = nullptr;
+    }
+
+    if (g_presentList.fenceEvent != nullptr)
+    {
+        CloseHandle(g_presentList.fenceEvent);
+        g_presentList.fenceEvent = nullptr;
+    }
+
+    g_presentFenceValue = 0;
+}
+
 bool EnsurePresentList(ID3D12Device* device)
 {
     if (g_presentList.list[0] != nullptr)
@@ -1465,20 +1502,36 @@ bool EnsurePresentList(ID3D12Device* device)
     {
         if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                   IID_PPV_ARGS(&g_presentList.allocator[i]))))
+        {
+            ResetPresentList();
             return false;
+        }
 
         if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_presentList.allocator[i], nullptr,
                                              IID_PPV_ARGS(&g_presentList.list[i]))))
+        {
+            ResetPresentList();
             return false;
+        }
 
         g_presentList.list[i]->Close();
     }
 
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_presentList.fence))))
+    {
+        ResetPresentList();
         return false;
+    }
 
     g_presentList.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    return g_presentList.fenceEvent != nullptr;
+
+    if (g_presentList.fenceEvent == nullptr)
+    {
+        ResetPresentList();
+        return false;
+    }
+
+    return true;
 }
 
 ID3D12GraphicsCommandList* GetPresentCommandList(ID3D12Device* device, unsigned int slot)
@@ -1514,7 +1567,8 @@ ID3D12GraphicsCommandList* GetPresentCommandList(ID3D12Device* device, unsigned 
     return g_presentList.list[slot];
 }
 
-// Executed lists hand their fence value over so the next use of the slot can wait on it.
+// Executed lists hand their fence value over so the next use of the slot can wait on it -- and,
+// because the flip tears, the CPU waits for the work before the flip lands.
 void SubmitPresentList(ID3D12CommandQueue* queue, unsigned int slot)
 {
     if (!g_presentList.dirty[slot])
@@ -1525,6 +1579,21 @@ void SubmitPresentList(ID3D12CommandQueue* queue, unsigned int slot)
         queue->ExecuteCommandLists(1, (ID3D12CommandList**) &g_presentList.list[slot]);
         g_presentList.fenceValue[slot] = ++g_presentFenceValue;
         queue->Signal(g_presentList.fence, g_presentList.fenceValue[slot]);
+
+        // The swapchain presents with DXGI_PRESENT_ALLOW_TEARING (the frame-generation path sets
+        // it), so the flip can land before this work is done -- and would then show the frame the
+        // game left, while the pass's history had already moved on: the flicker and the smear. The
+        // work must be in before the flip, so the CPU waits for it here, on the queue it was just
+        // given to. The frame-generation library does the same before it presents a generated
+        // frame: with tearing, the wait is a contract, not a choice.
+        if (SUCCEEDED(g_presentList.fence->SetEventOnCompletion(g_presentList.fenceValue[slot],
+                                                                g_presentList.fenceEvent)))
+        {
+            const DWORD wait = WaitForSingleObject(g_presentList.fenceEvent, 5000);
+
+            if (wait != WAIT_OBJECT_0)
+                LOG_WARN("DLSS-NR present: submit wait returned {} (slot {})", (unsigned) wait, slot);
+        }
     }
 
     g_presentList.dirty[slot] = false;
@@ -3571,37 +3640,7 @@ void Shutdown()
         g_dummyMotion = nullptr;
     }
 
-    for (unsigned int i = 0; i < PresentList::kSlots; ++i)
-    {
-        if (g_presentList.list[i] != nullptr)
-        {
-            g_presentList.list[i]->Release();
-            g_presentList.list[i] = nullptr;
-        }
-
-        if (g_presentList.allocator[i] != nullptr)
-        {
-            g_presentList.allocator[i]->Release();
-            g_presentList.allocator[i] = nullptr;
-        }
-
-        g_presentList.fenceValue[i] = 0;
-        g_presentList.dirty[i] = false;
-    }
-
-    if (g_presentList.fence != nullptr)
-    {
-        g_presentList.fence->Release();
-        g_presentList.fence = nullptr;
-    }
-
-    if (g_presentList.fenceEvent != nullptr)
-    {
-        CloseHandle(g_presentList.fenceEvent);
-        g_presentList.fenceEvent = nullptr;
-    }
-
-    g_presentFenceValue = 0;
+    ResetPresentList();
     g_sourceIsPresent = false;
 
     g_capture.release();
