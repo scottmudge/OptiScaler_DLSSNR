@@ -492,4 +492,45 @@ or the game, since OptiScaler does not cleanly re-initialise the NGX stack at ru
  MfgUnlock=false
 ```
 
+### Neural Rendering (DLSS-NR)
+
+DLSS 5 Neural Rendering synthesises detail in the upscaler's output. It needs
+`nvngx_dlssnr.dll` from a driver that ships it, beside OptiScaler or the game
+executable, plus the `nvngx.dll_dlssnr.dll` shim this package bundles. Direct3D
+only, and undocumented — it is driven through the NGX snippet directly, so none
+of it is officially supported.
+
+`HookMethod` decides where the pass runs and what it runs on:
+
+* **Auto (0)** — the swapchain backbuffer, once the game's upscaler has handed
+  over its depth and motion; the upscaler's output until then.
+* **Upscaled (1, default)** — in place, immediately after the game's upscaler
+  writes its output. That output is linear and un-tonemapped, so the white-point
+  controls map it into something the model recognises. A game whose exposure
+  moves (Kingdom Come: Deliverance II) shows that as a brightness or colour shift
+  until a paper white is found.
+* **Present (2)** — at present time, on the swapchain's backbuffer: the frame
+  the game has finished and tone-mapped, which is the kind of picture the model
+  was trained on. There is no white point to find, the white-point controls do
+  not apply, and with frame generation the base frame is enhanced before the
+  generated frames are made from it. This is how the ReShade-based
+  implementations run it.
+
+The Present hook needs the game's depth and motion to reproject its history.
+They are pinned when the upscaler runs and used when the frame is presented.
+`RequireDlss` (Present only) decides what happens when they are not in hand:
+true shows the frame as the game rendered it, false runs on dummy temporals
+(constant depth, no motion), which treats the scene as standing still and suits
+a title whose upscaler is not DLSS.
+
+```ini
+[DlssNr]
+; Master switch. true or false - default false
+Enabled=false
+; Where the pass runs: 0 Auto, 1 Upscaled, 2 Present. Default 1.
+HookMethod=1
+; Present hook only: require the upscaler's depth and motion. Default true.
+RequireDlss=true
+```
+
 

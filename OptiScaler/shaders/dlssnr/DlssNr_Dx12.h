@@ -111,9 +111,14 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // Sizes come from the resources. Everything the pass cannot work out for itself is in
     // DlssNrFrameInfo; everything the user chose stays in Config. colour and output may be the same
     // resource. timingQueue is the queue this list will be executed on, when the caller knows it.
+    //
+    // presentSource marks the backbuffer-source call: output is the pass's own UAV scratch (never the
+    // game's buffer), so the arrival state is always UNORDERED_ACCESS regardless of the OutputResource
+    // Barrier setting, and the exposure scan is skipped because the white point is not used on an
+    // already tone-mapped frame.
     void Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* colour, ID3D12Resource* depth,
                   ID3D12Resource* motion, ID3D12Resource* output, const DlssNrFrameInfo& frame,
-                  ID3D12CommandQueue* timingQueue = nullptr);
+                  ID3D12CommandQueue* timingQueue = nullptr, bool presentSource = false);
 
     // Records one pass. Resources that a given mode does not read may be null; a stand-in is bound in
     // their place so every descriptor in the table is valid.

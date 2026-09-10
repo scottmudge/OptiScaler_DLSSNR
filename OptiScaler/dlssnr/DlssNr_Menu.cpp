@@ -176,6 +176,57 @@ void RenderMenu(Config* config, float menuResScale)
         }
 
         ImGui::Spacing();
+        ImGui::SeparatorText("Source");
+
+        {
+            const bool vkOnly = DlssNr::IsRunningVk();
+
+            if (vkOnly)
+                ImGui::BeginDisabled();
+
+            static const char* hookMethodNames[] = { "Auto", "Upscaled", "Present" };
+            int hookMethod = (int) config->DlssNrHookMethod.value_or_default();
+            if (hookMethod < 0 || hookMethod > 2)
+                hookMethod = 1;
+
+            if (ImGui::Combo("Hook method", &hookMethod, hookMethodNames, IM_ARRAYSIZE(hookMethodNames)))
+                config->DlssNrHookMethod = (uint32_t) hookMethod;
+
+            if (vkOnly)
+                ImGui::EndDisabled();
+
+            HelpMarker("Where the pass runs, and what it runs on.\n\nAuto: the swapchain backbuffer, as soon "
+                           "as the game's upscaler has handed over its depth and motion; the upscaler's "
+                           "output until then.\n\nUpscaled: in place, immediately after the game's upscaler "
+                           "has written its output. That output is linear and un-tonemapped, so the Colour "
+                           "section below must map it into something the model recognises -- the paper "
+                           "white is where a game that moves its exposure makes itself felt.\n\nPresent: at "
+                           "the moment of present, on the swapchain's backbuffer -- the frame the game has "
+                           "finished and tone-mapped, which is exactly the kind of picture the model was "
+                           "trained on. There is nothing to divide and no white point to find, and with "
+                           "frame generation the base frame is enhanced before the generated frames are "
+                           "made from it. This is how the ReShade implementations run it, and the one a "
+                           "title like KCD2 wants.\n\nDirect3D only; on a Vulkan game the pass keeps "
+                           "running where it always has.");
+
+            if (hookMethod == 2)
+            {
+                bool requireDlss = config->DlssNrRequireDlss.value_or_default();
+                if (ImGui::Checkbox("Require DLSS temporal inputs", &requireDlss))
+                    config->DlssNrRequireDlss = requireDlss;
+
+                HelpMarker("Present needs the game's depth and motion to reproject its history. With this "
+                               "on, a frame that has no temporal inputs yet is shown as the game rendered "
+                               "it. With it off, the pass runs on dummy temporals -- constant depth, no "
+                               "motion -- and treats the scene as standing still, which is right for a "
+                               "title whose upscaler is not DLSS.");
+            }
+
+            if (!vkOnly)
+                ImGui::TextUnformatted(DlssNr::HookStatus());
+        }
+
+        ImGui::Spacing();
         ImGui::PushItemWidth(220.0f * menuResScale);
 
         // Any percentage, rather than a handful of steps somebody chose in advance. The lower bound
@@ -394,6 +445,17 @@ void RenderMenu(Config* config, float menuResScale)
         HelpMarker("Lets the model find skin itself rather than treating the frame uniformly.");
 
         ImGui::SeparatorText("Colour");
+
+        // The Present hook's source is already a finished frame: none of the white-point machinery
+        // does anything on it, so the section stands aside and says so.
+        if (config->DlssNrHookMethod.value_or_default() == 2)
+        {
+            ImGui::TextDisabled("Not used by the Present hook: its source is the finished frame the game\n"
+                                "has already tone-mapped, so there is nothing to divide and no white\n"
+                                "point to find here.");
+        }
+        else
+        {
 
         ImGui::TextDisabled("The model was trained on finished, sRGB-encoded frames. The upscaler's\n"
                             "output is not one: it is linear and open-ended. These decide how it is\n"
@@ -957,6 +1019,8 @@ void RenderMenu(Config* config, float menuResScale)
             }
         }
 
+
+        }
 
         }
 

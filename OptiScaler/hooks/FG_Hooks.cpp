@@ -11,6 +11,7 @@
 
 #include <hudfix/Hudfix_Dx12.h>
 #include <resource_tracking/ResTrack_Dx12.h>
+#include <dlssnr/DlssNr.h>
 
 #include <misc/FrameLimit.h>
 
@@ -1268,6 +1269,14 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     // Used at wrapped_swapchain LocalPresent to determine is frame is interpolated or not
     if (willPresent)
         state.fgPresentIsCalled = true;
+
+    // The DLSS-NR present hook: the frame is finished at this point, and it still is the frame
+    // frame generation will interpolate FROM, so enhancing it here enhances the generated frames
+    // with it. It runs before the original present, which is where the SL interposer captures the
+    // FG input, and before the wrapped swapchain's own hook on this same flip, which then stands
+    // down for the base frame and keeps enhancing the cycle's generated frames.
+    if (willPresent && state.swapchainInteropApi == SwapchainInteropApi::None && state.currentCommandQueue != nullptr)
+        DlssNr::RunPresentPass((IDXGISwapChain3*) This, state.currentCommandQueue, true);
 
     HRESULT result;
     if (pPresentParameters == nullptr)

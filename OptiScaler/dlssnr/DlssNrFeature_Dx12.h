@@ -84,6 +84,31 @@ struct CalibrationReading
 
 CalibrationReading Calibration();
 
+// The present hook. Runs the pass on the swapchain backbuffer at present time: the frame the game
+// finished, tone-mapped and display-referred, so the white point, the exposure meter and the scan are
+// all out of the picture -- the pass is a copy out, a run, a copy back. The temporal inputs are the
+// depth and motion the game's upscaler evaluate handed over earlier in the same frame, pinned by
+// EvaluateAfterUpscale; without them the pass either waits (Require DLSS on) or runs on dummy
+// temporals that treat the scene as static (Require DLSS off).
+//
+// Called once per present, after the overlay has been drawn and before the original Present, with the
+// queue the frame was rendered on. It records on a private command list and executes it on that
+// queue, so it is ordered before whatever frame generation work follows the present and there is
+// nothing to wait on from the CPU.
+//
+// Does nothing when the hook method is not present (and, in auto, has no temporal inputs yet): the
+// upscaler-side pass then owns the frame.
+//
+// fgHook distinguishes the two hooks a frame-generation cycle has on its base frame: the frame
+// generation present hook (called before the original present, so its answer is what frame
+// generation interpolates FROM) and the wrapped swapchain's own hook (every flip of the cycle, the
+// generated frames included). The base frame runs once, on whichever hook runs first.
+void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool fgHook);
+
+// The source the pass is running from, for the overlay: the upscaler's output or the swapchain, and
+// whether the temporal inputs are in hand. Empty while nothing has run yet.
+const char* HookStatus();
+
 // Whether the model is loaded and running, for the overlay.
 bool IsRunning();
 

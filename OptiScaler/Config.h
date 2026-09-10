@@ -260,6 +260,15 @@ class Config
     // Toggles the pass in game. Unbound by default -- a key that does something unexpected is worse
     // than one that does nothing.
     CustomOptional<int> DlssNrToggleKey { UnboundKey };
+    // Where the pass runs. 0 Auto (present source when the upscaler exposes DLSS temporal inputs,
+    // otherwise the upscaler output), 1 Upscaled (in-place on the upscaler's output, the historical
+    // behaviour), 2 Present (on the swapchain backbuffer at present time, the display-referred
+    // source that needs no white point). Default 1 keeps every existing setup byte-identical.
+    CustomOptional<uint32_t> DlssNrHookMethod { 1 };
+    // Present hook only: whether DLSS temporal inputs (depth + motion from the game's upscaler call)
+    // are required. True skips a present frame that has no temporal inputs yet; false falls back to
+    // dummy temporals (constant depth, zero motion) so the pass still enhances the still frame.
+    CustomOptional<bool> DlssNrRequireDlss { true };
     CustomOptional<uint32_t> DlssNrPreset { 0 };
     CustomOptional<float> DlssNrIntensity { 1.0f };
     // 0 default (standard), 1 natural, 2 cinematic -- the model's own processing profiles.

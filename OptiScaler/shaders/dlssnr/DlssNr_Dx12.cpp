@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include <set>
+#include <dxgi1_6.h>
 
 #include <dlssnr/DlssNr.h>
 
@@ -1357,6 +1358,281 @@ void ReportSkipOnce(const char* reason)
         LOG_INFO("DLSS-NR did not run: {}", reason);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The present hook.
+//
+// The pass runs on the swapchain backbuffer at present time. The backbuffer is the frame the game
+// has FINISHED -- tone-mapped and display-referred by the engine -- which is exactly the kind of
+// picture the model was trained on. It needs no white point, no exposure meter, no scan: the encode
+// and the resolve run as passthrough copies and the model simply edits the finished frame. That is
+// the whole reason it exists, and the reason a title like KCD2, whose auto-exposure moves under a
+// fixed divisor, looks right with it and washed out without.
+//
+// The temporal inputs (depth, motion) are not on the swapchain: they are what the game's upscaler
+// evaluate carried earlier in the same frame, pinned here by EvaluateAfterUpscale so they still
+// exist when present time comes. Without them the pass waits, or -- when Require DLSS is off -- runs
+// on dummy temporals that tell the model the scene is standing still.
+//
+// A backbuffer is a render target and a copy source, never a compute target (no UAV flag), so the
+// frame is copied into a private copy, the pass runs on that, and the result is copied back: two
+// full-resolution copies bought with no other state, in exchange for the whole white-point problem
+// going away.
+// ---------------------------------------------------------------------------------------------
+
+struct PresentTemporal
+{
+    ID3D12Resource* depth = nullptr;   // AddRef'd; the game's texture, pinned for present time
+    ID3D12Resource* motion = nullptr;  // AddRef'd
+    DlssNrFrameInfo frame {};          // the flags and subrects the upscaler was told, same frame
+    unsigned long long capturedAt = 0; // g_frames when it was pinned
+    bool valid = false;
+};
+
+PresentTemporal g_temporal;
+
+// The private copy the pass runs on. Created on demand and rebuilt when the backbuffer changes
+// shape; left in UNORDERED_ACCESS between passes, which is the state Dispatch expects on arrival.
+ID3D12Resource* g_bbCopy = nullptr;
+unsigned int g_bbCopyWidth = 0;
+unsigned int g_bbCopyHeight = 0;
+DXGI_FORMAT g_bbCopyFormat = DXGI_FORMAT_UNKNOWN;
+
+// The dummy temporals: constant depth and zero motion. Filled once at creation -- the fill is part
+// of their definition, and the pass never writes them -- so they can sit in a state of their own.
+ID3D12Resource* g_dummyDepth = nullptr;
+ID3D12Resource* g_dummyMotion = nullptr;
+unsigned int g_dummyWidth = 0;
+unsigned int g_dummyHeight = 0;
+
+// Whether the pass that last ran was the present one, so a source change can reset the model's
+// history: an accumulation built against one source is not a good prior for the other.
+bool g_sourceIsPresent = false;
+
+// Once per present cycle. With a frame-generation swapchain in play the FG present hook and the
+// wrapped swapchain's own hook both see the base frame's present, nested in one call: the FG hook
+// goes first, on purpose (its answer is what frame generation interpolates FROM), so the wrapped
+// hook stands down for that flip. The generated frames the cycle then presents carry no new FG-hook
+// run, so they still run their own. A cycle with no FG-hook run (no FG swapchain, or the hook not
+// yet eligible) falls through and the wrapped hook owns every flip of it.
+unsigned long long g_presentPassSeq = 0;  // FG-hook runs, committed
+unsigned long long g_presentPassSeen = 0; // the seq the wrapped hook has accounted for
+
+// The private command list at present time. No command list of the game's is open at that point, so
+// the pass brings its own and executes it on the game's queue immediately before the real present.
+// Same queue, same order: the work is recorded ahead of whatever frame generation does after the
+// present, so nothing has to wait on the CPU for it.
+//
+// One list per backbuffer slot, ringed with a fence, the shape the frame-generation overlay lists
+// already use: by the time a slot comes round again its last work is long retired and the wait is a
+// no-op.
+struct PresentList
+{
+    static constexpr unsigned int kSlots = BUFFER_COUNT;
+    ID3D12CommandAllocator* allocator[kSlots] = {};
+    ID3D12GraphicsCommandList* list[kSlots] = {};
+    UINT64 fenceValue[kSlots] = {};
+    bool dirty[kSlots] = {};
+    ID3D12Fence* fence = nullptr;
+    HANDLE fenceEvent = nullptr;
+};
+
+PresentList g_presentList;
+UINT64 g_presentFenceValue = 0;
+
+void ReleasePresentTemporal()
+{
+    if (g_temporal.depth != nullptr)
+    {
+        g_temporal.depth->Release();
+        g_temporal.depth = nullptr;
+    }
+
+    if (g_temporal.motion != nullptr)
+    {
+        g_temporal.motion->Release();
+        g_temporal.motion = nullptr;
+    }
+
+    g_temporal.valid = false;
+}
+
+bool EnsurePresentList(ID3D12Device* device)
+{
+    if (g_presentList.list[0] != nullptr)
+        return true;
+
+    for (unsigned int i = 0; i < PresentList::kSlots; ++i)
+    {
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(&g_presentList.allocator[i]))))
+            return false;
+
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_presentList.allocator[i], nullptr,
+                                             IID_PPV_ARGS(&g_presentList.list[i]))))
+            return false;
+
+        g_presentList.list[i]->Close();
+    }
+
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_presentList.fence))))
+        return false;
+
+    g_presentList.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    return g_presentList.fenceEvent != nullptr;
+}
+
+ID3D12GraphicsCommandList* GetPresentCommandList(ID3D12Device* device, unsigned int slot)
+{
+    if (g_presentList.list[0] == nullptr && !EnsurePresentList(device))
+        return nullptr;
+
+    if (!g_presentList.dirty[slot])
+    {
+        // The last work recorded here may still be running on the queue; the fence says so.
+        if (g_presentList.fenceValue[slot] != 0 &&
+            g_presentList.fence->GetCompletedValue() < g_presentList.fenceValue[slot])
+        {
+            if (SUCCEEDED(g_presentList.fence->SetEventOnCompletion(g_presentList.fenceValue[slot],
+                                                                    g_presentList.fenceEvent)))
+            {
+                const DWORD wait = WaitForSingleObject(g_presentList.fenceEvent, 5000);
+
+                if (wait != WAIT_OBJECT_0)
+                    LOG_WARN("DLSS-NR present: allocator wait returned {} (slot {})", (unsigned) wait, slot);
+            }
+        }
+
+        if (FAILED(g_presentList.allocator[slot]->Reset()))
+            return nullptr;
+
+        if (FAILED(g_presentList.list[slot]->Reset(g_presentList.allocator[slot], nullptr)))
+            return nullptr;
+
+        g_presentList.dirty[slot] = true;
+    }
+
+    return g_presentList.list[slot];
+}
+
+// Executed lists hand their fence value over so the next use of the slot can wait on it.
+void SubmitPresentList(ID3D12CommandQueue* queue, unsigned int slot)
+{
+    if (!g_presentList.dirty[slot])
+        return;
+
+    if (SUCCEEDED(g_presentList.list[slot]->Close()))
+    {
+        queue->ExecuteCommandLists(1, (ID3D12CommandList**) &g_presentList.list[slot]);
+        g_presentList.fenceValue[slot] = ++g_presentFenceValue;
+        queue->Signal(g_presentList.fence, g_presentList.fenceValue[slot]);
+    }
+
+    g_presentList.dirty[slot] = false;
+}
+
+// A recorded list that will not be executed (a failure inside the pass) is dropped: the backbuffer
+// stays as the game left it, which is the right frame to show.
+void DropPresentList(unsigned int slot) { g_presentList.dirty[slot] = false; }
+
+bool EnsureBbCopy(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format)
+{
+    if (g_bbCopy != nullptr && g_bbCopyWidth == width && g_bbCopyHeight == height &&
+        g_bbCopyFormat == format)
+        return true;
+
+    // The old copy may still be in flight on the queue: park it, do not release it.
+    ParkNrResource(g_bbCopy);
+
+    g_bbCopy = CreateScratch(device, format, width, height);
+    g_bbCopyWidth = width;
+    g_bbCopyHeight = height;
+    g_bbCopyFormat = format;
+
+    // A fresh copy is undefined, but the first thing the pass records is the copy from the
+    // backbuffer, which writes every texel before anything reads it, so the garbage is never seen.
+    return g_bbCopy != nullptr;
+}
+
+// Present without DLSS: the scene is told to be standing still. Constant depth means no occlusion
+// to cut reprojected history against, and zero motion means every pixel reprojects onto itself.
+// Created once per size and filled once; the pass never writes them.
+bool EnsureDummyTemporal(ID3D12Device* device, ID3D12GraphicsCommandList* list, unsigned int width,
+                         unsigned int height)
+{
+    if (g_dummyDepth != nullptr && g_dummyMotion != nullptr && g_dummyWidth == width &&
+        g_dummyHeight == height)
+        return true;
+
+    ParkNrResource(g_dummyDepth);
+    ParkNrResource(g_dummyMotion);
+
+    D3D12_HEAP_PROPERTIES heap {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                               IID_PPV_ARGS(&g_dummyDepth))))
+        return false;
+
+    desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                               IID_PPV_ARGS(&g_dummyMotion))))
+        return false;
+
+    const FLOAT depthOne[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    const FLOAT motionZero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    // No descriptor and no rect list: the whole surface, which is the entire point of the fill.
+    list->ClearUnorderedAccessViewFloat((D3D12_GPU_DESCRIPTOR_HANDLE) nullptr, (D3D12_CPU_DESCRIPTOR_HANDLE) nullptr,
+                                        g_dummyDepth, depthOne, 0, nullptr);
+    list->ClearUnorderedAccessViewFloat((D3D12_GPU_DESCRIPTOR_HANDLE) nullptr, (D3D12_CPU_DESCRIPTOR_HANDLE) nullptr,
+                                        g_dummyMotion, motionZero, 0, nullptr);
+
+    g_dummyWidth = width;
+    g_dummyHeight = height;
+    return true;
+}
+
+// Pins this frame's temporal inputs for the present pass.
+//
+// The old capture is released rather than parked because its last reader -- the present pass that
+// ran at last present -- is already ordered ahead of everything the next frame will record: the
+// game renders the next frame on the same queue after this present was submitted, so by the time a
+// new capture arrives the old one is done. A capture whose present pass never ran (the pass failed,
+// or the setting moved) is simply never read, which is also safe to release.
+void CaptureTemporal(NVSDK_NGX_Parameter* params, const DlssNrFrameInfo& frame)
+{
+    ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
+    ID3D12Resource* motion = GetResource(params, NVSDK_NGX_Parameter_MotionVectors, "DLSSD.MotionVectors");
+
+    if (depth == nullptr || motion == nullptr)
+        return;
+
+    ReleasePresentTemporal();
+
+    depth->AddRef();
+    motion->AddRef();
+    g_temporal.depth = depth;
+    g_temporal.motion = motion;
+    g_temporal.frame = frame;
+    g_temporal.capturedAt = g_frames;
+    g_temporal.valid = true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -1524,8 +1800,9 @@ DlssNr_Dx12::~DlssNr_Dx12()
 }
 
 void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* colour,
-                           ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
-                           const DlssNrFrameInfo& frame, ID3D12CommandQueue* timingQueue)
+                            ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
+                            const DlssNrFrameInfo& frame, ID3D12CommandQueue* timingQueue,
+                            bool presentSource)
 {
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
@@ -1545,10 +1822,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // did not. This pass then reads and writes the output as a UAV, so it normalises to that here and
     // restores the arrival state before every exit. When the config is unset the two states are equal
     // and Barrier() skips the no-op, so the default path is byte-identical.
+    //
+    // The present call is the exception: its output is the pass's own scratch, which the present
+    // path leaves in UNORDERED_ACCESS between passes, so the setting does not apply to it.
     const D3D12_RESOURCE_STATES outputArrival =
-        Config::Instance()->OutputResourceBarrier.has_value()
-            ? (D3D12_RESOURCE_STATES) Config::Instance()->OutputResourceBarrier.value()
-            : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        presentSource
+            ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            : (Config::Instance()->OutputResourceBarrier.has_value()
+                   ? (D3D12_RESOURCE_STATES) Config::Instance()->OutputResourceBarrier.value()
+                   : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     Barrier(cmdList, target, outputArrival, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -2179,7 +2461,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     }
 
     // Read the exposure scan's candidates on the pass's own command list, once a frame.
-    DlssNr::ExposureScan::Tick(device, cmdList);
+    //
+    // The present call never uses the scan's answer: its frame is already tone-mapped, the encode
+    // and the resolve run as passthroughs, and the white point is not read. The scan's copies and
+    // readback would be pure cost, so it is off for that call.
+    if (!presentSource)
+        DlssNr::ExposureScan::Tick(device, cmdList);
 
     ID3D12Resource* depthIn = ReadableGuide(device, cmdList, depth, &g_nr.depthClone);
     ID3D12Resource* motionIn = ReadableGuide(device, cmdList, motion, &g_nr.motionClone);
@@ -2200,7 +2487,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     const float mvToWorkX = width != 0 ? (float) workWidth / (float) width : 1.0f;
     const float mvToWorkY = height != 0 ? (float) workHeight / (float) height : 1.0f;
 
-    SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
+    // On the present call the frame shown and the backbuffer are one and the same: the target IS the
+    // backbuffer's content, so it is handed over as the backbuffer extra as well.
+    SetExtras(cfg, nullptr, presentSource ? target : nullptr, 0, 0, presentSource ? width : 0,
+              presentSource ? height : 0);
 
     // The proxy path, when asked for. Same inputs, same model -- the difference is who calls it.
     //
@@ -2522,6 +2812,203 @@ void RetryAfterFailure()
 
 }
 
+const char* HookStatus()
+{
+    if (!Config::Instance()->DlssNrEnabled.value_or_default())
+        return "off";
+
+    const uint32_t method = Config::Instance()->DlssNrHookMethod.value_or_default();
+
+    if (method == 2)
+    {
+        if (g_temporal.valid)
+            return "present: active, swapchain source with DLSS temporal inputs";
+        if (Config::Instance()->DlssNrRequireDlss.value_or_default())
+            return "present: waiting for DLSS temporal inputs from the upscaler";
+        return "present: active, presentation backbuffer with dummy temporal inputs";
+    }
+
+    if (method == 0)
+    {
+        if (g_temporal.valid)
+            return "auto: present, swapchain source with DLSS temporal inputs";
+        return "auto: upscaled, the upscaler has handed over no temporal inputs yet";
+    }
+
+    return "upscaled: active on the upscaler's output";
+}
+
+void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool fgHook)
+{
+    const Config& cfg = *Config::Instance();
+
+    if (!cfg.DlssNrEnabled.value_or_default() || g_nr.failed || swapchain == nullptr || queue == nullptr)
+        return;
+
+    const uint32_t method = cfg.DlssNrHookMethod.value_or_default();
+
+    // Present only, and in auto only once the upscaler has handed over temporal inputs; until then
+    // the upscaler-side pass owns the frame and this one has no source to run on.
+    if (method != 2 && !(method == 0 && g_temporal.valid))
+        return;
+
+    // The base frame of a frame-generation cycle has two hooks on it, one call deep inside the
+    // other. The FG one runs first and owns the frame, so this one stands down for it; the frames
+    // of the cycle that carry no new FG run of their own still do.
+    if (!fgHook && g_presentPassSeq != g_presentPassSeen)
+    {
+        g_presentPassSeen = g_presentPassSeq;
+        return;
+    }
+
+    ID3D12Resource* backbuffer = nullptr;
+    const UINT index = swapchain->GetCurrentBackBufferIndex();
+
+    if (FAILED(swapchain->GetBuffer(index, IID_PPV_ARGS(&backbuffer))) || backbuffer == nullptr)
+    {
+        ReportSkipOnce("the present hook could not reach the swapchain's backbuffer");
+        return;
+    }
+
+    ID3D12Device* device = nullptr;
+
+    if (FAILED(backbuffer->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+    {
+        backbuffer->Release();
+        ReportSkipOnce("the backbuffer belongs to no D3D12 device");
+        return;
+    }
+
+    if (g_compose == nullptr)
+        g_compose = std::make_unique<DlssNr_Dx12>("Neural Rendering", device);
+
+    if (g_compose == nullptr)
+    {
+        backbuffer->Release();
+        device->Release();
+        ReportSkipOnce("the pass could not be created");
+        return;
+    }
+
+    const D3D12_RESOURCE_DESC bbDesc = backbuffer->GetDesc();
+    const unsigned int width = (unsigned int) bbDesc.Width;
+    const unsigned int height = (unsigned int) bbDesc.Height;
+
+    // The state the game left the backbuffer in. D3D12 has no query for it -- the state is a
+    // property of the driver's internal bookkeeping, not of the resource -- so it is assumed to
+    // be a render target, which is where the game's final draw or blit leaves it. The from-state
+    // of a transition is a hint the driver does not check and a fact only the debugger does, and
+    // the transition to COPY_SOURCE is enforced regardless: a wrong guess cannot corrupt the
+    // frame, it only costs a validation warning on a device nobody runs.
+    const D3D12_RESOURCE_STATES bbState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    const unsigned int slot = index % PresentList::kSlots;
+    ID3D12GraphicsCommandList* list = GetPresentCommandList(device, slot);
+
+    if (list == nullptr)
+    {
+        backbuffer->Release();
+        device->Release();
+        ReportSkipOnce("the present hook's command list could not be prepared");
+        return;
+    }
+
+    if (!EnsureBbCopy(device, width, height, bbDesc.Format))
+    {
+        DropPresentList(slot);
+        backbuffer->Release();
+        device->Release();
+        g_nr.failed = true;
+        g_nr.reason = "the present hook's backbuffer copy could not be created";
+        LOG_ERROR("DLSS-NR present: {}", g_nr.reason);
+        return;
+    }
+
+    // The frame's temporal inputs: this frame's capture, the dummy pair when DLSS is not required,
+    // or nothing at all, in which case the frame is the game's and there is nothing to do.
+    ID3D12Resource* depth = nullptr;
+    ID3D12Resource* motion = nullptr;
+    DlssNrFrameInfo frame {};
+
+    if (g_temporal.valid)
+    {
+        depth = g_temporal.depth;
+        motion = g_temporal.motion;
+        frame = g_temporal.frame;
+    }
+    else if (cfg.DlssNrRequireDlss.value_or_default())
+    {
+        DropPresentList(slot);
+        backbuffer->Release();
+        device->Release();
+        ReportSkipOnce("the present hook is waiting for the upscaler's temporal inputs");
+        return;
+    }
+    else if (!EnsureDummyTemporal(device, list, width, height))
+    {
+        DropPresentList(slot);
+        backbuffer->Release();
+        device->Release();
+        g_nr.failed = true;
+        g_nr.reason = "the present hook's dummy temporals could not be created";
+        LOG_ERROR("DLSS-NR present: {}", g_nr.reason);
+        return;
+    }
+    else
+    {
+        depth = g_dummyDepth;
+        motion = g_dummyMotion;
+        frame = DlssNrFrameInfo {};
+    }
+
+    // A source change invalidates the model's history: the accumulation it has built is against the
+    // other source, and the first frame of this one starts clean.
+    if (!g_sourceIsPresent)
+    {
+        g_sourceIsPresent = true;
+        g_nr.reset = true;
+    }
+
+    // The backbuffer is not a compute target, so the pass runs on the copy: out, run, back.
+    Barrier(list, backbuffer, bbState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyResource(g_bbCopy, backbuffer);
+    Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(list, backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, bbState);
+
+    // A finished frame: the encode and the resolve become copies, and the white point is not read.
+    frame.ColourIsLinearHdr = false;
+    frame.ExposureTexture = nullptr;
+    frame.PreExposure = 1.0f;
+
+    // Committed: from here the frame is this hook's, and the other hook of the cycle stays out.
+    if (fgHook)
+        ++g_presentPassSeq;
+
+    g_compose->Dispatch(list, g_bbCopy, depth, motion, g_bbCopy, frame, queue, true);
+
+    if (g_nr.failed)
+    {
+        // The pass latches its failure and the copy-back is not recorded: the backbuffer stays as
+        // the game left it, which is the frame to show, and the recorded list is dropped.
+        DropPresentList(slot);
+        backbuffer->Release();
+        device->Release();
+        return;
+    }
+
+    Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(list, backbuffer, bbState, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyResource(backbuffer, g_bbCopy);
+    Barrier(list, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, bbState);
+    Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    SubmitPresentList(queue, slot);
+
+    backbuffer->Release();
+    device->Release();
+}
+
 // Reads the game's parameter block and runs the pass on what it finds.
 //
 // This is the call site's job, not the pass's. A caller that has the resources in hand -- a
@@ -2708,6 +3195,29 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
                              which, scanned, low, high);
             }
         }
+    }
+
+    // Where the pass runs from, and when.
+    //
+    // The present hook runs at present time, on the backbuffer, and its temporal inputs are exactly
+    // the depth and motion of THIS evaluate -- so it pins them here and defers the pass to present,
+    // and this call does nothing more. The upscaler-side pass runs in place, now.
+    //
+    // In auto the present hook takes over once the upscaler has handed over temporal inputs, and
+    // owns the frame from that frame on: the in-place pass below would otherwise run the model on
+    // the linear output for the same frame the present pass enhances on the backbuffer.
+    const uint32_t method = Config::Instance()->DlssNrHookMethod.value_or_default();
+
+    if (method != 1)
+        CaptureTemporal(params, frame);
+
+    if (method == 2 || (method == 0 && g_temporal.valid))
+        return;
+
+    if (g_sourceIsPresent)
+    {
+        g_sourceIsPresent = false;
+        g_nr.reset = true;
     }
 
     // The upscaler's inputs are at render resolution while colour and output are at display
@@ -3040,6 +3550,59 @@ void Shutdown()
         g_nr.motionClone->Release();
         g_nr.motionClone = nullptr;
     }
+
+    ReleasePresentTemporal();
+
+    if (g_bbCopy != nullptr)
+    {
+        g_bbCopy->Release();
+        g_bbCopy = nullptr;
+    }
+
+    if (g_dummyDepth != nullptr)
+    {
+        g_dummyDepth->Release();
+        g_dummyDepth = nullptr;
+    }
+
+    if (g_dummyMotion != nullptr)
+    {
+        g_dummyMotion->Release();
+        g_dummyMotion = nullptr;
+    }
+
+    for (unsigned int i = 0; i < PresentList::kSlots; ++i)
+    {
+        if (g_presentList.list[i] != nullptr)
+        {
+            g_presentList.list[i]->Release();
+            g_presentList.list[i] = nullptr;
+        }
+
+        if (g_presentList.allocator[i] != nullptr)
+        {
+            g_presentList.allocator[i]->Release();
+            g_presentList.allocator[i] = nullptr;
+        }
+
+        g_presentList.fenceValue[i] = 0;
+        g_presentList.dirty[i] = false;
+    }
+
+    if (g_presentList.fence != nullptr)
+    {
+        g_presentList.fence->Release();
+        g_presentList.fence = nullptr;
+    }
+
+    if (g_presentList.fenceEvent != nullptr)
+    {
+        CloseHandle(g_presentList.fenceEvent);
+        g_presentList.fenceEvent = nullptr;
+    }
+
+    g_presentFenceValue = 0;
+    g_sourceIsPresent = false;
 
     g_capture.release();
     g_gpuTime.reset();

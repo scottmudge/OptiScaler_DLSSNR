@@ -9,6 +9,7 @@
 #include <hooks/D3D12_Hooks.h>
 
 #include <menu/menu_overlay_dx.h>
+#include <dlssnr/DlssNr.h>
 
 #include <misc/FrameLimit.h>
 
@@ -392,6 +393,14 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             fakenvapi::reportFGPresent(pSwapChain, fgIsActive, isInterpolated);
         }
 #endif
+
+        // The DLSS-NR present hook, for the swapchain this class owns: the frame is finished here
+        // (the overlay is drawn) and the original Present is next, so the pass runs between the two.
+        // Every flip of a frame-generation cycle reaches this way -- the base frame and each
+        // generated one -- and the hook inside it stands down for the base frame if the frame
+        // generation present hook has already run it.
+        if (!isD3D11 && cq != nullptr)
+            DlssNr::RunPresentPass((IDXGISwapChain3*) pSwapChain, cq, false);
 
         _frameCounter++;
         State::Instance().frameCount = _frameCounter;

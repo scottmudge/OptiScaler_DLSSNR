@@ -319,6 +319,8 @@ bool Config::Reload(std::filesystem::path iniPath)
             // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
             DlssNrEnabled.set_from_config(readBool("DlssNr", "Enabled"));
             DlssNrToggleKey.set_from_config(readInt("DlssNr", "ToggleKey"));
+            DlssNrHookMethod.set_from_config(readUInt("DlssNr", "HookMethod"));
+            DlssNrRequireDlss.set_from_config(readBool("DlssNr", "RequireDlss"));
             DlssNrTransferStrength.set_from_config(readFloat("DlssNr", "TransferStrength"));
             DlssNrColourStrength.set_from_config(readFloat("DlssNr", "ColourStrength"));
             DlssNrMaxRatio.set_from_config(readFloat("DlssNr", "MaxRatio"));
@@ -1215,6 +1217,9 @@ bool Config::SaveIni()
         auto toggle = Instance()->DlssNrToggleKey.value_for_config();
         ini.SetValue("DlssNr", "ToggleKey", GetIntValue(toggle, toggle > 0).c_str());
     }
+    ini.SetValue("DlssNr", "HookMethod", GetIntValue(Instance()->DlssNrHookMethod.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "RequireDlss",
+                 GetBoolValue(Instance()->DlssNrRequireDlss.value_for_config()).c_str());
     ini.SetValue("DlssNr", "TransferStrength",
                  GetFloatValue(Instance()->DlssNrTransferStrength.value_for_config()).c_str());
     ini.SetValue("DlssNr", "ColourStrength",
