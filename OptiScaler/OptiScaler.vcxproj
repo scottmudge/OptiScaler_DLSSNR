@@ -237,7 +237,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <OmitFramePointers>true</OmitFramePointers>
       <EnableFiberSafeOptimizations>true</EnableFiberSafeOptimizations>
-      <FunctionLevelLinking>false</FunctionLevelLinking>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <DisableSpecificWarnings>4250</DisableSpecificWarnings>
     </ClCompile>
@@ -251,6 +251,7 @@
       <ModuleDefinitionFile>Source.def</ModuleDefinitionFile>
       <DelayLoadDLLs>vulkan-1.dll;dxgi.dll;d3d12.dll;D3DCOMPILER_47.dll</DelayLoadDLLs>
       <AdditionalOptions>/ignore:4099</AdditionalOptions>
+      <IgnoreSpecificDefaultLibraries>LIBCMT.lib</IgnoreSpecificDefaultLibraries>
     </Link>
     <PostBuildEvent>
       <Command>md $(SolutionDir)x64\Release\a\
