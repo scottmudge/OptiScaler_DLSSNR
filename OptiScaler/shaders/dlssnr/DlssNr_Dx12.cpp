@@ -1555,11 +1555,23 @@ ID3D12GraphicsCommandList* GetPresentCommandList(ID3D12Device* device, unsigned 
             }
         }
 
-        if (FAILED(g_presentList.allocator[slot]->Reset()))
-            return nullptr;
+        HRESULT hr = g_presentList.allocator[slot]->Reset();
 
-        if (FAILED(g_presentList.list[slot]->Reset(g_presentList.allocator[slot], nullptr)))
+        if (FAILED(hr))
+        {
+            // An open list locks its allocator; a drop must have left one, which means the slot was
+            // already dead. Logged so the KCD2 log can say so instead of guessing.
+            LOG_WARN("DLSS-NR present: allocator reset failed on slot {} (HRESULT {:08X})", slot, (unsigned) hr);
             return nullptr;
+        }
+
+        hr = g_presentList.list[slot]->Reset(g_presentList.allocator[slot], nullptr);
+
+        if (FAILED(hr))
+        {
+            LOG_WARN("DLSS-NR present: list reset failed on slot {} (HRESULT {:08X})", slot, (unsigned) hr);
+            return nullptr;
+        }
 
         g_presentList.dirty[slot] = true;
     }
@@ -1599,9 +1611,21 @@ void SubmitPresentList(ID3D12CommandQueue* queue, unsigned int slot)
     g_presentList.dirty[slot] = false;
 }
 
-// A recorded list that will not be executed (a failure inside the pass) is dropped: the backbuffer
-// stays as the game left it, which is the right frame to show.
-void DropPresentList(unsigned int slot) { g_presentList.dirty[slot] = false; }
+// A recorded list that will not be executed (a failure or skip inside the pass) is dropped: the
+// backbuffer stays as the game left it, which is the right frame to show. The list must be CLOSED
+// before the next Reset of its allocator -- an open list locks its allocator, the Reset fails, and
+// the slot is dead for the rest of the session. At startup, when the temporal inputs are not in
+// hand yet, that is exactly how all four slots used to die in a row, and the present path with them.
+void DropPresentList(unsigned int slot)
+{
+    if (!g_presentList.dirty[slot])
+        return;
+
+    if (FAILED(g_presentList.list[slot]->Close()))
+        LOG_WARN("DLSS-NR present: dropped list slot {} would not close", slot);
+
+    g_presentList.dirty[slot] = false;
+}
 
 bool EnsureBbCopy(ID3D12Device* device, unsigned int width, unsigned int height, DXGI_FORMAT format)
 {
@@ -3064,6 +3088,17 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
         backbuffer->Release();
         device->Release();
         return;
+    }
+
+    {
+        static bool firstLogged = false;
+
+        if (!firstLogged)
+        {
+            firstLogged = true;
+            LOG_INFO("DLSS-NR present: first pass on the backbuffer ({}x{}, {} hook)", width, height,
+                     fgHook ? "frame-generation" : "swapchain");
+        }
     }
 
     Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
