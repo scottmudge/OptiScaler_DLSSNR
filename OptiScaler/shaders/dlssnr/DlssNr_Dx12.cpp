@@ -1408,14 +1408,21 @@ unsigned int g_dummyHeight = 0;
 // history: an accumulation built against one source is not a good prior for the other.
 bool g_sourceIsPresent = false;
 
-// Once per present cycle. With a frame-generation swapchain in play the FG present hook and the
-// wrapped swapchain's own hook both see the base frame's present, nested in one call: the FG hook
-// goes first, on purpose (its answer is what frame generation interpolates FROM), so the wrapped
-// hook stands down for that flip. The generated frames the cycle then presents carry no new FG-hook
-// run, so they still run their own. A cycle with no FG-hook run (no FG swapchain, or the hook not
-// yet eligible) falls through and the wrapped hook owns every flip of it.
-unsigned long long g_presentPassSeq = 0;  // FG-hook runs, committed
-unsigned long long g_presentPassSeen = 0; // the seq the wrapped hook has accounted for
+// The present hooks and the frame-generation cycle.
+//
+// Every present -- the base frame and each generated one -- reaches RunPresentPass: the base frame
+// through the FG present hook (fgHook) and every flip through the wrapped swapchain hook. With a
+// frame-generation cycle in play the FG hook runs the pass on the base frame BEFORE frame
+// generation, so generation interpolates FROM the enhanced frame and the generated frames inherit
+// the enhancement. They must NOT re-run the pass: reprojecting the temporal history twice per game
+// frame with the same motion vectors feeds the accumulation its own output and diverges it -- the
+// flicker that built up and then killed the device. So while the FG hook is driving the cycle (it
+// has run within the last few flips) the wrapped hook stands down for every flip of it. A cycle with
+// no recent FG-hook run -- no frame generation, or the hook not yet eligible -- falls through and
+// the wrapped hook owns every flip of it.
+unsigned long long g_presentFlip = 0;    // every present, from either hook
+unsigned long long g_lastFgFlip = 0;     // the present-flip the FG hook last drove
+constexpr unsigned long long kFgHookTimeout = 16; // flips without an FG-hook run before the wrapped hook reclaims them
 
 // The private command list at present time. No command list of the game's is open at that point, so
 // the pass brings its own and executes it on the game's queue immediately before the real present.
@@ -2938,14 +2945,13 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
     if (method != 2 && !(method == 0 && g_temporal.valid))
         return;
 
-    // The base frame of a frame-generation cycle has two hooks on it, one call deep inside the
-    // other. The FG one runs first and owns the frame, so this one stands down for it; the frames
-    // of the cycle that carry no new FG run of their own still do.
-    if (!fgHook && g_presentPassSeq != g_presentPassSeen)
-    {
-        g_presentPassSeen = g_presentPassSeq;
+    ++g_presentFlip;
+
+    // The wrapped hook. While the FG present hook is driving the cycle it has already enhanced the
+    // base frame before frame generation, so every frame of the cycle inherits it and this one
+    // stands down for all of them; the timeout reclaims a cycle the FG hook is not driving.
+    if (!fgHook && g_lastFgFlip != 0 && (g_presentFlip - g_lastFgFlip) < kFgHookTimeout)
         return;
-    }
 
     ID3D12Resource* backbuffer = nullptr;
     const UINT index = swapchain->GetCurrentBackBufferIndex();
@@ -3067,9 +3073,10 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
     frame.ExposureTexture = nullptr;
     frame.PreExposure = 1.0f;
 
-    // Committed: from here the frame is this hook's, and the other hook of the cycle stays out.
+    // Committed: from here the frame is this hook's, and it marks the cycle as driven so the
+    // wrapped hook stands down for the base flip and every generated frame of the cycle.
     if (fgHook)
-        ++g_presentPassSeq;
+        g_lastFgFlip = g_presentFlip;
 
     g_compose->Dispatch(list, g_bbCopy, depth, motion, g_bbCopy, frame, queue, true);
 
