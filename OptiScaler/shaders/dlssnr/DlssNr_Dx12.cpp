@@ -26,6 +26,20 @@
 #include "precompile/DlssNr_Shader.h"
 #include "../output_scaling/OS_Dx12.h"
 
+// Compile-time debug logging for the present hook. Add DLSSNR_DEBUG to the build (a preprocessor
+// definition) to turn it on and drop it to turn it off. On, it logs -- per flip -- the dedup
+// decision (which hook runs the pass and which stands down), the temporal age (how many frames the
+// depth/motion capture is stale), the model evaluate, and the deferred frees. That set is exactly
+// what separates the three failure shapes: a double-application (the pass running more than once per
+// game frame), a stale temporal (the age climbing instead of staying 0), and a use-after-free (a
+// retire freeing a resource the GPU is still on). Off by default, so the hot path stays clean and
+// the definition can be removed from the project build config once the hook is confirmed working.
+#ifdef DLSSNR_DEBUG
+#define NR_DBG(...) LOG_INFO("DLSS-NR [DBG] " __VA_ARGS__)
+#else
+#define NR_DBG(...) do {} while (0)
+#endif
+
 namespace
 {
 // NGX result codes, by name.
@@ -688,6 +702,15 @@ void TickNrRetired()
             ++i;
             continue;
         }
+
+        // [DBG] the use-after-free detector. This is where a parked temporal, backbuffer copy, or
+        // scratch is finally released; it must land well after the last pass that read it. The
+        // pointer matches the capture/park log, so a free that follows a still-live pass is visible.
+        NR_DBG("retired free: {} 0x{:X} (32 frames after its park, now frame{}, {} still parked)",
+               g_nrRetired[i].feature != nullptr ? "feature" : "resource",
+               (uintptr_t) (g_nrRetired[i].feature != nullptr ? g_nrRetired[i].feature
+                                                              : g_nrRetired[i].resource),
+               g_frames, g_nrRetired.size() - 1);
 
         if (g_nrRetired[i].feature != nullptr && g_nr.release != nullptr)
             g_nr.release(g_nrRetired[i].feature);
@@ -1724,6 +1747,12 @@ void CaptureTemporal(NVSDK_NGX_Parameter* params, const DlssNrFrameInfo& frame)
     g_temporal.frame = frame;
     g_temporal.capturedAt = g_frames;
     g_temporal.valid = true;
+
+    // [DBG] the capture is what keeps the age at 0; if this line stops appearing while the pass
+    // keeps running, the age climbs and the pass goes stale. The pointers let a stale capture be
+    // matched to the free that finally retires it.
+    NR_DBG("temporal capture @frame{} depth=0x{:X} motion=0x{:X} (parked previous pair)",
+           g_frames, (uintptr_t) g_temporal.depth, (uintptr_t) g_temporal.motion);
 }
 
 } // namespace
@@ -2631,6 +2660,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
 
+    // [DBG] the model actually ran on the backbuffer source. One of these per "RUN" flip is the
+    // correct cadence; a reset=1 that is not followed by fresh frames (the age staying 0 while the
+    // game resets) is a scene cut, while a steady stream with result != 1 is the model failing.
+    if (presentSource)
+        NR_DBG("model evaluate @frame{} result={} work={}x{} reset={} mvScale={:.3f}/{:.3f}",
+               g_frames, (uint32_t) result, workWidth, workHeight, (int) g_nr.reset,
+               g_nr.guideMvScaleX, g_nr.guideMvScaleY);
+
     g_nr.reset = false;
 
     // Supersampling probe: report the model working ABOVE native so a test log tells us whether NGX even
@@ -2950,7 +2987,17 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
     // The wrapped hook. While the FG present hook is driving the cycle it has already enhanced the
     // base frame before frame generation, so every frame of the cycle inherits it and this one
     // stands down for all of them; the timeout reclaims a cycle the FG hook is not driving.
-    if (!fgHook && g_lastFgFlip != 0 && (g_presentFlip - g_lastFgFlip) < kFgHookTimeout)
+    const bool wrapStandsDown = !fgHook && g_lastFgFlip != 0 &&
+                                (g_presentFlip - g_lastFgFlip) < kFgHookTimeout;
+
+    // [DBG] the heart of the double-application question: which flip actually runs the pass. A
+    // correct frame-generation cycle shows one "RUN" (the fg hook) and "stand-down"s for every other
+    // flip of the cycle; two "RUN"s per cycle is the double-application that diverges the history.
+    NR_DBG("flip={} site={} -> {} (fg@{}, dt={}/{})", g_presentFlip,
+           fgHook ? "fg" : "wrap", wrapStandsDown ? "stand-down" : "RUN",
+           g_lastFgFlip, g_lastFgFlip != 0 ? g_presentFlip - g_lastFgFlip : 0, kFgHookTimeout);
+
+    if (wrapStandsDown)
         return;
 
     ID3D12Resource* backbuffer = nullptr;
@@ -3052,6 +3099,14 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
         motion = g_dummyMotion;
         frame = DlssNrFrameInfo {};
     }
+
+    // [DBG] the re-application question: is the depth/motion capture fresh (age 0) or stale? A
+    // climbing age means the upscaler stopped handing over temporal inputs this frame and the pass
+    // is reprojecting an increasingly old frame -- the "NR on top of old frames" ghosting.
+    NR_DBG("flip={} temporal={} age={} (captured@{}, now={}) size={}x{}",
+           g_presentFlip, g_temporal.valid ? "dlss" : "dummy",
+           g_temporal.valid ? g_frames - g_temporal.capturedAt : 0,
+           g_temporal.valid ? g_temporal.capturedAt : 0, g_frames, width, height);
 
     // A source change invalidates the model's history: the accumulation it has built is against the
     // other source, and the first frame of this one starts clean.
