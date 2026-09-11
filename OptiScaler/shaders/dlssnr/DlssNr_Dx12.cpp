@@ -1579,8 +1579,14 @@ ID3D12GraphicsCommandList* GetPresentCommandList(ID3D12Device* device, unsigned 
     return g_presentList.list[slot];
 }
 
-// Executed lists hand their fence value over so the next use of the slot can wait on it -- and,
-// because the flip tears, the CPU waits for the work before the flip lands.
+// Executed lists hand their fence value over so the next use of the slot can wait on it before
+// its allocator is reset. The flip itself is NOT waited on here: a present -- even a tearing one --
+// is a queue operation ordered after every list that has used the backbuffer, so the scan-out reads
+// the enhanced frame without the CPU stalling. Blocking the present thread on the pass's completion
+// instead sits in the middle of the frame-generation library's own present path, where the GPU runs
+// several frames behind and the library's input processing is fence-synchronized with this thread;
+// stalling it there is what wedged and then killed the device. The same-queue order already puts the
+// work ahead of the flip and ahead of the frame generation's capture of the base frame.
 void SubmitPresentList(ID3D12CommandQueue* queue, unsigned int slot)
 {
     if (!g_presentList.dirty[slot])
@@ -1591,21 +1597,6 @@ void SubmitPresentList(ID3D12CommandQueue* queue, unsigned int slot)
         queue->ExecuteCommandLists(1, (ID3D12CommandList**) &g_presentList.list[slot]);
         g_presentList.fenceValue[slot] = ++g_presentFenceValue;
         queue->Signal(g_presentList.fence, g_presentList.fenceValue[slot]);
-
-        // The swapchain presents with DXGI_PRESENT_ALLOW_TEARING (the frame-generation path sets
-        // it), so the flip can land before this work is done -- and would then show the frame the
-        // game left, while the pass's history had already moved on: the flicker and the smear. The
-        // work must be in before the flip, so the CPU waits for it here, on the queue it was just
-        // given to. The frame-generation library does the same before it presents a generated
-        // frame: with tearing, the wait is a contract, not a choice.
-        if (SUCCEEDED(g_presentList.fence->SetEventOnCompletion(g_presentList.fenceValue[slot],
-                                                                g_presentList.fenceEvent)))
-        {
-            const DWORD wait = WaitForSingleObject(g_presentList.fenceEvent, 5000);
-
-            if (wait != WAIT_OBJECT_0)
-                LOG_WARN("DLSS-NR present: submit wait returned {} (slot {})", (unsigned) wait, slot);
-        }
     }
 
     g_presentList.dirty[slot] = false;
@@ -1700,11 +1691,14 @@ bool EnsureDummyTemporal(ID3D12Device* device, ID3D12GraphicsCommandList* list, 
 
 // Pins this frame's temporal inputs for the present pass.
 //
-// The old capture is released rather than parked because its last reader -- the present pass that
-// ran at last present -- is already ordered ahead of everything the next frame will record: the
-// game renders the next frame on the same queue after this present was submitted, so by the time a
-// new capture arrives the old one is done. A capture whose present pass never ran (the pass failed,
-// or the setting moved) is simply never read, which is also safe to release.
+// The old capture is PARKED (freed a comfortable number of evaluates later) rather than released
+// here. These are the game's depth and motion textures, and the pass that last read them runs on the
+// present hook's own command list -- submitted to the game's queue, but not covered by any fence the
+// game or Streamline waits on. With frame generation the GPU is several frames behind the CPU, so by
+// the time this capture arrives the previous pass can still be in flight and reading them. Releasing
+// them here would let the last reference drop under in-flight work and free the textures out from
+// under the GPU -- the same "freed under in-flight work kills the device" failure the retired set
+// parks against everywhere else in this file.
 void CaptureTemporal(NVSDK_NGX_Parameter* params, const DlssNrFrameInfo& frame)
 {
     ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
@@ -1713,7 +1707,8 @@ void CaptureTemporal(NVSDK_NGX_Parameter* params, const DlssNrFrameInfo& frame)
     if (depth == nullptr || motion == nullptr)
         return;
 
-    ReleasePresentTemporal();
+    ParkNrResource(g_temporal.depth);
+    ParkNrResource(g_temporal.motion);
 
     depth->AddRef();
     motion->AddRef();
