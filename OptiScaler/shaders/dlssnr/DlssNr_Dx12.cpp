@@ -2672,6 +2672,29 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     // Multi-pass was removed: re-feeding the model its own output re-opened the same-command-list
     // feature-creation hang, and the colour core is not settled enough to build on. One evaluate.
+    //
+    // [PROBE] present-only accumulation test. The "NR compounds then snaps back" symptom appears on a
+    // FROZEN frame (constant input, zero motion) where a temporal filter should converge, not compound.
+    // Forcing a reset every present frame clears the model's internal accumulation each time, turning it
+    // into a pure spatial filter. If the compounding stops with this on, the accumulation is proven to be
+    // the thing drifting; if it persists, the accumulation is exonerated. Gated on DLSSNR_DEBUG so it
+    // never ships and never affects the real path.
+#ifdef DLSSNR_DEBUG
+    // Auto-armed in a debug build. The one-time log line is the proof the probe is live in this build.
+    static bool probeLogged = false;
+    if (presentSource)
+    {
+        g_nr.reset = true;
+        if (!probeLogged)
+        {
+            probeLogged = true;
+            LOG_INFO("DLSS-NR [PROBE] present-accumulation reset is ARMED: the model's history is "
+                     "cleared every present frame. If the 'NR compounds then snaps back' symptom is "
+                     "gone on a frozen frame, the internal accumulation was the cause.");
+        }
+    }
+#endif
+
     const int result = g_nr.evaluate(
         cmdList, g_nr.feature, g_nr.capabilityParams, modelInput, depthIn, motionIn, g_nr.output,
         workWidth, workHeight, guideWidth, guideHeight, motionWidth, motionHeight, depthBaseX,
