@@ -3156,12 +3156,36 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
            g_temporal.valid ? g_frames - g_temporal.capturedAt : 0,
            g_temporal.valid ? g_temporal.capturedAt : 0, g_frames, width, height);
 
+    // The re-present guard. This pass writes its result back into the swapchain's backbuffer (there
+    // is nowhere else: the swapchain presents its own buffers), so if the game presents the same
+    // finished frame more than once without the upscaler handing over new temporal inputs -- a slow
+    // frame, a hitched frame, an FG cycle re-presenting the base frame -- the buffer in front of us
+    // still holds the previous pass's result. Running again re-encodes that enhanced frame and feeds
+    // it back through the model, stacking the edit on top of itself until the game's next frame
+    // finally overwrites the buffer: the "NR grows exaggerated, then snaps to the current frame"
+    // symptom. The temporal capture is the game's own new-frame signal; if it has not advanced
+    // since this pass last committed, this present is a re-present of an already-enhanced frame and
+    // leaving the buffer untouched shows the correct result. Keyed on the capture, not the flip,
+    // because a generated-frame re-present of the base frame increments neither the game's frame
+    // nor the capture.
+    static unsigned long long lastCommittedCapture = ~0ULL;
+
+    if (g_temporal.valid && g_temporal.capturedAt == lastCommittedCapture)
+    {
+        NR_DBG("flip={} SKIP re-present of capture {}", g_presentFlip, lastCommittedCapture);
+        DropPresentList(slot);
+        backbuffer->Release();
+        device->Release();
+        return;
+    }
+
     // A source change invalidates the model's history: the accumulation it has built is against the
     // other source, and the first frame of this one starts clean.
     if (!g_sourceIsPresent)
     {
         g_sourceIsPresent = true;
         g_nr.reset = true;
+        lastCommittedCapture = ~0ULL;   // the guard above belongs to the other source's captures
     }
 
     // The backbuffer is not a compute target, so the pass runs on the copy: out, run, back.
@@ -3177,9 +3201,14 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
     frame.PreExposure = 1.0f;
 
     // Committed: from here the frame is this hook's, and it marks the cycle as driven so the
-    // wrapped hook stands down for the base flip and every generated frame of the cycle.
+    // wrapped hook stands down for the base flip and every generated frame of the cycle. The
+    // capture stamp lets the next present of an unchanged frame stand down too -- see the
+    // re-present guard above.
     if (fgHook)
         g_lastFgFlip = g_presentFlip;
+
+    if (g_temporal.valid)
+        lastCommittedCapture = g_temporal.capturedAt;
 
     g_compose->Dispatch(list, g_bbCopy, depth, motion, g_bbCopy, frame, queue, true);
 
