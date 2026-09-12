@@ -2064,29 +2064,54 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     {
         bool valid;
         bool depthInverted;
+        bool mvLowRes;
         float mvScaleX;
         float mvScaleY;
         unsigned int guideW;
         unsigned int guideH;
+        unsigned int motionW;
+        unsigned int motionH;
+        unsigned int depthBaseX;
+        unsigned int depthBaseY;
+        unsigned int motionBaseX;
+        unsigned int motionBaseY;
         unsigned int frameW;
         unsigned int frameH;
     };
 
     static GuideReport loggedGuides {};
 
-    const GuideReport guidesNow { true,       g_nr.guideDepthInverted, g_nr.guideMvScaleX,
-                                  g_nr.guideMvScaleY, guideWidth,      guideHeight,
-                                  width,      (unsigned int) height };
+    const GuideReport guidesNow { true,             g_nr.guideDepthInverted, frame.MotionVectorsLowResolution,
+                                  g_nr.guideMvScaleX, g_nr.guideMvScaleY, guideWidth,      guideHeight,
+                                  motionWidth,      motionHeight,          depthBaseX,     depthBaseY,
+                                  motionBaseX,      motionBaseY,           width,          (unsigned int) height };
 
     if (!loggedGuides.valid || loggedGuides.depthInverted != guidesNow.depthInverted ||
+        loggedGuides.mvLowRes != guidesNow.mvLowRes ||
         loggedGuides.mvScaleX != guidesNow.mvScaleX || loggedGuides.mvScaleY != guidesNow.mvScaleY ||
         loggedGuides.guideW != guidesNow.guideW || loggedGuides.guideH != guidesNow.guideH ||
+        loggedGuides.motionW != guidesNow.motionW || loggedGuides.motionH != guidesNow.motionH ||
+        loggedGuides.depthBaseX != guidesNow.depthBaseX || loggedGuides.depthBaseY != guidesNow.depthBaseY ||
+        loggedGuides.motionBaseX != guidesNow.motionBaseX || loggedGuides.motionBaseY != guidesNow.motionBaseY ||
         loggedGuides.frameW != guidesNow.frameW || loggedGuides.frameH != guidesNow.frameH)
     {
         loggedGuides = guidesNow;
-        LOG_INFO("DLSS-NR guides: depth {}, motion vector scale {} x {}, guides {}x{} for a {}x{} frame",
-                 g_nr.guideDepthInverted ? "inverted" : "not inverted", g_nr.guideMvScaleX,
-                 g_nr.guideMvScaleY, guideWidth, guideHeight, width, height);
+        LOG_INFO("DLSS-NR guides: depth {} {}x{} @{},{}; motion {}x{} @{},{} (low-res {}); mv scale {} x {} "
+                 "for a {}x{} work frame",
+                 g_nr.guideDepthInverted ? "inverted" : "not inverted", guideWidth, guideHeight, depthBaseX,
+                 depthBaseY, motionWidth, motionHeight, motionBaseX, motionBaseY,
+                 frame.MotionVectorsLowResolution ? "yes" : "no", g_nr.guideMvScaleX, g_nr.guideMvScaleY,
+                 width, height);
+        // [DBG] the full resolution triad on the present path: the model warps a frameW x frameH
+        // accumulation using mvScale-scaled vectors that live in a motionW x motionH texture. If the
+        // mv scale does not describe the motion texture's own resolution the reprojection lands off and
+        // the history drifts -- the "NR compounds then snaps back" symptom.
+        if (presentSource)
+            NR_DBG("present triad: work={}x{} guide(depth)={}x{} motion={}x{} lowRes={} mvScale={:.3f}/{:.3f} "
+                   "depth@{},{} motion@{},{}",
+                   width, height, guideWidth, guideHeight, motionWidth, motionHeight,
+                   frame.MotionVectorsLowResolution ? "yes" : "no", g_nr.guideMvScaleX, g_nr.guideMvScaleY,
+                   depthBaseX, depthBaseY, motionBaseX, motionBaseY);
     }
 
     if (cfg.DlssNrProxyProbe.value_or_default())
