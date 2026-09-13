@@ -269,6 +269,12 @@ class Config
     // are required. True skips a present frame that has no temporal inputs yet; false falls back to
     // dummy temporals (constant depth, zero motion) so the pass still enhances the still frame.
     CustomOptional<bool> DlssNrRequireDlss { true };
+    // Present hook only: wait for the enhancement of this frame to finish on the GPU before the
+    // present call returns, so the flip always reads the completed edit and never catches a
+    // half-written or one-frame-late backbuffer. With frame generation interposing on the same
+    // present, the unsynchronised variant lets the enhanced write land after the flip has already
+    // consumed/released the buffer, which reads back as an accumulating echo. Default true.
+    CustomOptional<bool> DlssNrPresentSync { true };
     CustomOptional<uint32_t> DlssNrPreset { 0 };
     CustomOptional<float> DlssNrIntensity { 1.0f };
     // 0 default (standard), 1 natural, 2 cinematic -- the model's own processing profiles.

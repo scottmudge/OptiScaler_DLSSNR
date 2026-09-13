@@ -22,6 +22,7 @@
 
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include "precompile/DlssNr_Shader.h"
 #include "../output_scaling/OS_Dx12.h"
@@ -3277,8 +3278,8 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
     // but withholds the final write-back: the screen shows what the game wrote. If the stacking is
     // gone with this on, the write-back IS the ingress and the fix is to restructure where the edit
     // lands; if it persists, the loop never involved our output and we look at the FG present stream.
-    // Default ON so a debug rebuild answers it immediately; flip to false to return to normal.
-    static bool noWriteBackProbe = true;
+    // ANSWERED (stacking vanished with it on) -- default now OFF; kept as a switch for later probes.
+    static bool noWriteBackProbe = false;
 
     if (noWriteBackProbe)
     {
@@ -3302,6 +3303,35 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
     }
 
     SubmitPresentList(queue, slot);
+
+    // The flip consumes this backbuffer the moment the hook returns. SubmitPresentList deliberately
+    // does not wait, and with a frame-generation interposer holding the client presenting queue there
+    // is no queue-order guarantee that our write retires before the flip reads the buffer -- the
+    // write-back probe proved that an un-synced write lands late enough to re-enter a later frame as
+    // an accumulating echo. Sync (on by default) makes the present thread wait for THIS frame's list
+    // to retire before the flip can fire, so the enhanced content is always what the pipeline reads.
+    // Timed once per pulse so the cost of the guarantee is visible in the log.
+    if (Config::Instance()->DlssNrPresentSync.value_or_default() && g_presentList.fenceValue[slot] != 0 &&
+        g_presentList.fence->GetCompletedValue() < g_presentList.fenceValue[slot])
+    {
+        const auto waitStart = std::chrono::steady_clock::now();
+        const UINT64 done = g_presentList.fenceValue[slot];
+
+        if (SUCCEEDED(g_presentList.fence->SetEventOnCompletion(done, g_presentList.fenceEvent)))
+        {
+            // Generous bound: a real stall is loud in the log; a hang is not an option.
+            const DWORD wait = WaitForSingleObject(g_presentList.fenceEvent, 1000);
+            const double waitedMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart)
+                    .count();
+
+            if (wait != WAIT_OBJECT_0)
+                LOG_WARN("DLSS-NR present: completion wait returned {} after {:.1f} ms (slot {})",
+                         (unsigned) wait, waitedMs, slot);
+            else
+                NR_DBG("flip={} sync-wait {:.2f} ms", g_presentFlip, waitedMs);
+        }
+    }
 
     backbuffer->Release();
     device->Release();
