@@ -1276,7 +1276,25 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     // FG input, and before the wrapped swapchain's own hook on this same flip, which then stands
     // down for the base frame and keeps enhancing the cycle's generated frames.
     if (willPresent && state.swapchainInteropApi == SwapchainInteropApi::None && state.currentCommandQueue != nullptr)
+    {
         DlssNr::RunPresentPass((IDXGISwapChain3*) This, state.currentCommandQueue, true);
+
+#ifdef DLSSNR_DEBUG
+        // Ordering proof, logged once: the present hook enhances the BASE frame here, before the real
+        // present below (o_FGSCPresent) where Streamline's DLSS-G captures the FG input and generates
+        // the interpolated frames. Generated frames inherit the enhancement; the model never runs on
+        // them. If NR ran AFTER DLSS-G (on the output frames), this line would appear interleaved
+        // between presents at the interpolated rate instead of once per base frame.
+        static bool nrOrderingLogged = false;
+
+        if (!nrOrderingLogged)
+        {
+            nrOrderingLogged = true;
+            LOG_INFO("DLSS-NR [DBG] ordering OK: present hook enhanced the BASE frame pre-FG; "
+                     "o_FGSCPresent (next, runs DLSS-G) inherits it. Model runs once per base frame.");
+        }
+#endif
+    }
 
     HRESULT result;
     if (pPresentParameters == nullptr)

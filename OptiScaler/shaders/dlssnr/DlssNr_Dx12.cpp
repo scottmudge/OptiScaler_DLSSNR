@@ -1424,6 +1424,15 @@ unsigned long long g_renderSeq = 0;
 // new frame behind it, so enhancing it again would feed the model its own output.
 unsigned long long g_nrLastEnhancedSeq = 0;
 
+// Debug observability for the feedback loop (read only under DLSSNR_DEBUG; the counters themselves
+// are cheap enough to keep live): how often the no-new-render guard refused an enhancement, and the
+// fingerprint of a loop -- the same physical backbuffer being enhanced twice in a row.
+unsigned long long g_presentRuns = 0;        // enhancements actually performed
+unsigned long long g_presentSkips = 0;       // enhancements refused by the no-new-render guard
+ID3D12Resource* g_lastEnhancedBb = nullptr;  // buffer the last present pass wrote
+unsigned int g_lastEnhancedBbIdx = 0xFFFFFFFF;
+unsigned int g_sameBbStreak = 0, g_maxSameBbStreak = 0; // consecutive runs on the same physical buffer
+
 // The private copy the pass runs on. Created on demand and rebuilt when the backbuffer changes
 // shape; left in UNORDERED_ACCESS between passes, which is the state Dispatch expects on arrival.
 ID3D12Resource* g_bbCopy = nullptr;
@@ -3170,9 +3179,10 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
     // it: leave the backbuffer exactly as the game left it and present it unchanged.
     if (g_temporal.valid && g_temporal.renderSeq == g_nrLastEnhancedSeq)
     {
-        NR_DBG("flip={} site={} SKIP: render {} already enhanced (bbIdx={}, bb=0x{:X})",
+        ++g_presentSkips;
+        NR_DBG("flip={} site={} SKIP: render {} already enhanced (bbIdx={}, bb=0x{:X}, total skips {})",
                g_presentFlip, fgHook ? "fg" : "wrap", g_temporal.renderSeq, index,
-               (uintptr_t) backbuffer);
+               (uintptr_t) backbuffer, g_presentSkips);
         DropPresentList(slot);
         backbuffer->Release();
         device->Release();
@@ -3182,15 +3192,32 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
     if (g_temporal.valid)
         g_nrLastEnhancedSeq = g_temporal.renderSeq;
 
+    // Feedback fingerprint. A healthy stream rotates across the swapchain's buffers, so consecutive
+    // enhance calls address different physical buffers; a rising same-buffer streak means the pass is
+    // re-reading the buffer it just wrote -- the loop itself, caught red-handed.
+    ++g_presentRuns;
+    g_sameBbStreak = (backbuffer == g_lastEnhancedBb) ? g_sameBbStreak + 1 : 0;
+    g_maxSameBbStreak = g_sameBbStreak > g_maxSameBbStreak ? g_sameBbStreak : g_maxSameBbStreak;
+    g_lastEnhancedBb = backbuffer;
+    g_lastEnhancedBbIdx = index;
+
+    // A pulse so a debug log needn't be mined line by line: runs, guard skips, and the worst
+    // same-buffer streak so far. Healthy streaming is runs>0, skips>0 on held frames, streak 0-1.
+    if ((g_presentFlip & 0x7F) == 0)
+    {
+        NR_DBG("pulse: flips={} runs={} skips={} same-bb streak now/max={}/{}", g_presentFlip,
+               g_presentRuns, g_presentSkips, g_sameBbStreak, g_maxSameBbStreak);
+    }
+
     // [DBG] the re-application question: is the depth/motion capture fresh (age 0) or stale? A
     // climbing age means the upscaler stopped handing over temporal inputs this frame and the pass
     // is reprojecting an increasingly old frame -- the "NR on top of old frames" ghosting. The
     // backbuffer index/pointer is logged so a re-read of the same physical buffer can be spotted.
-    NR_DBG("flip={} temporal={} age={} (captured@{}, now={}) size={}x{} render={} bbIdx={} bb=0x{:X}",
+    NR_DBG("flip={} temporal={} age={} (captured@{}, now={}) size={}x{} render={} bbIdx={} bb=0x{:X} streak={}",
            g_presentFlip, g_temporal.valid ? "dlss" : "dummy",
            g_temporal.valid ? g_frames - g_temporal.capturedAt : 0,
            g_temporal.valid ? g_temporal.capturedAt : 0, g_frames, width, height,
-           g_temporal.valid ? g_temporal.renderSeq : 0, index, (uintptr_t) backbuffer);
+           g_temporal.valid ? g_temporal.renderSeq : 0, index, (uintptr_t) backbuffer, g_sameBbStreak);
 
     // A source change invalidates the model's history: the accumulation it has built is against the
     // other source, and the first frame of this one starts clean.
