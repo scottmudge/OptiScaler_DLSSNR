@@ -1408,10 +1408,21 @@ struct PresentTemporal
     ID3D12Resource* motion = nullptr;  // AddRef'd
     DlssNrFrameInfo frame {};          // the flags and subrects the upscaler was told, same frame
     unsigned long long capturedAt = 0; // g_frames when it was pinned
+    // A counter that advances ONLY when the game renders a frame (once per upscaler evaluate), never
+    // when this pass runs. Unlike capturedAt (which aliases g_frames), this is not incremented by the
+    // present pass, so it is the honest "a brand-new frame exists" signal the feedback guard needs.
+    unsigned long long renderSeq = 0;
     bool valid = false;
 };
 
 PresentTemporal g_temporal;
+
+// Advances once per game render (in CaptureTemporal). Used to tell a freshly-rendered frame from a
+// re-presented one, which g_frames (this pass's own counter) cannot do.
+unsigned long long g_renderSeq = 0;
+// The render the present pass last enhanced. A present whose temporal still carries this seq has no
+// new frame behind it, so enhancing it again would feed the model its own output.
+unsigned long long g_nrLastEnhancedSeq = 0;
 
 // The private copy the pass runs on. Created on demand and rebuilt when the backbuffer changes
 // shape; left in UNORDERED_ACCESS between passes, which is the state Dispatch expects on arrival.
@@ -1746,6 +1757,7 @@ void CaptureTemporal(NVSDK_NGX_Parameter* params, const DlssNrFrameInfo& frame)
     g_temporal.motion = motion;
     g_temporal.frame = frame;
     g_temporal.capturedAt = g_frames;
+    g_temporal.renderSeq = ++g_renderSeq;
     g_temporal.valid = true;
 
     // [DBG] the capture is what keeps the age at 0; if this line stops appearing while the pass
@@ -3148,13 +3160,37 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
         frame = DlssNrFrameInfo {};
     }
 
+    // Break the present feedback loop. The reset-probe run ruled out the model's temporal
+    // accumulation as the thing that compounds (the symptom was unchanged with the history cleared
+    // every frame), so the "NR keeps growing on a stuck frame" can only be the model re-reading its
+    // own output from the backbuffer. That becomes possible when the swapchain re-presents a frame
+    // the game did not re-render, and this pass is asked to enhance it a second time. The render
+    // sequence is stamped once per REAL render (in CaptureTemporal), never by this pass, so a flip
+    // whose temporal still carries the sequence this pass already enhanced has no new frame behind
+    // it: leave the backbuffer exactly as the game left it and present it unchanged.
+    if (g_temporal.valid && g_temporal.renderSeq == g_nrLastEnhancedSeq)
+    {
+        NR_DBG("flip={} site={} SKIP: render {} already enhanced (bbIdx={}, bb=0x{:X})",
+               g_presentFlip, fgHook ? "fg" : "wrap", g_temporal.renderSeq, index,
+               (uintptr_t) backbuffer);
+        DropPresentList(slot);
+        backbuffer->Release();
+        device->Release();
+        return;
+    }
+
+    if (g_temporal.valid)
+        g_nrLastEnhancedSeq = g_temporal.renderSeq;
+
     // [DBG] the re-application question: is the depth/motion capture fresh (age 0) or stale? A
     // climbing age means the upscaler stopped handing over temporal inputs this frame and the pass
-    // is reprojecting an increasingly old frame -- the "NR on top of old frames" ghosting.
-    NR_DBG("flip={} temporal={} age={} (captured@{}, now={}) size={}x{}",
+    // is reprojecting an increasingly old frame -- the "NR on top of old frames" ghosting. The
+    // backbuffer index/pointer is logged so a re-read of the same physical buffer can be spotted.
+    NR_DBG("flip={} temporal={} age={} (captured@{}, now={}) size={}x{} render={} bbIdx={} bb=0x{:X}",
            g_presentFlip, g_temporal.valid ? "dlss" : "dummy",
            g_temporal.valid ? g_frames - g_temporal.capturedAt : 0,
-           g_temporal.valid ? g_temporal.capturedAt : 0, g_frames, width, height);
+           g_temporal.valid ? g_temporal.capturedAt : 0, g_frames, width, height,
+           g_temporal.valid ? g_temporal.renderSeq : 0, index, (uintptr_t) backbuffer);
 
     // A source change invalidates the model's history: the accumulation it has built is against the
     // other source, and the first frame of this one starts clean.
