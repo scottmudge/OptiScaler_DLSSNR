@@ -3267,11 +3267,39 @@ void RunPresentPass(IDXGISwapChain3* swapchain, ID3D12CommandQueue* queue, bool 
         }
     }
 
-    Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Barrier(list, backbuffer, bbState, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyResource(backbuffer, g_bbCopy);
-    Barrier(list, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, bbState);
-    Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+#ifdef DLSSNR_DEBUG
+    // [PROBE] feedback-ingress test. The last build fingerprinted the pass completely: fresh render
+    // every run (renderSeq advances, skips=0), a DIFFERENT physical backbuffer every run (streak 0/0),
+    // and the model reset every run (reset=1) -- yet the on-screen NR effect still stacked. With the
+    // model stateless and the buffer fresh, the only remaining channel is that something downstream
+    // reads the backbuffer we write and feeds the edit into a later frame's content (the FG capture
+    // or a game post pass). This probe runs the whole pass as normal (same GPU cost, same telemetry)
+    // but withholds the final write-back: the screen shows what the game wrote. If the stacking is
+    // gone with this on, the write-back IS the ingress and the fix is to restructure where the edit
+    // lands; if it persists, the loop never involved our output and we look at the FG present stream.
+    // Default ON so a debug rebuild answers it immediately; flip to false to return to normal.
+    static bool noWriteBackProbe = true;
+
+    if (noWriteBackProbe)
+    {
+        static bool nbLogged = false;
+
+        if (!nbLogged)
+        {
+            nbLogged = true;
+            LOG_INFO("DLSS-NR [PROBE] write-back WITHHELD: the model still runs every base frame but "
+                     "the backbuffer is left exactly as the game wrote it (no NR visible).");
+        }
+    }
+    else
+#endif
+    {
+        Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(list, backbuffer, bbState, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(backbuffer, g_bbCopy);
+        Barrier(list, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, bbState);
+        Barrier(list, g_bbCopy, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     SubmitPresentList(queue, slot);
 
