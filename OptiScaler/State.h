@@ -152,11 +152,6 @@ class State
 
     // OptiFG
     bool fgPresentIsCalled = false;
-    // True only while inside the base frame's real present (set around the o_FGSCPresent call in
-    // FGHooks::FGPresent, which re-enters the wrapped swapchain's LocalPresent). Generated frames'
-    // presents arrive unnested and see false. Used by DLSS-NR's present hook to edit only the
-    // base frame.
-    bool fgBasePresentInFlight = false;
     bool fgOnlyGenerated = false;
     bool fgHudlessCompare = false;
     bool fgChanged = false;

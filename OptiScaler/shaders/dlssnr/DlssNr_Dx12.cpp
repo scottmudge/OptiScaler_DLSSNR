@@ -1511,13 +1511,27 @@ void NoteHookMethod(unsigned int hook)
     g_nr.reset = true;
 }
 
-// The present hook's recording machinery: one allocator, one list, one fence, executed on the
-// presenting queue inside the game's own Present call. A single set is enough because the pass
-// records and submits exactly once per present, and the fence from the previous present is long
-// retired by the time the next comes around -- if it somehow is not, that present goes without
-// the model rather than stalling the frame on the swapchain's thread.
-ID3D12CommandAllocator* g_presentAllocator = nullptr;
-ID3D12GraphicsCommandList* g_presentList = nullptr;
+// The present hook's recording machinery: its own allocator+list pairs and one fence, executed
+// on the presenting queue inside the game's own Present call -- between the game's frame and
+// frame generation's work, so the model only ever sees base frames.
+// A slot is a (allocator, list) pair plus the fence value of the last list recorded into it.
+// One slot per present would still collide with itself a queue-deep later -- the presenting thread
+// runs ahead of the GPU by a frame or two in a deep pipeline, so the previous present's list is
+// routinely still in flight when the next arrives, and skipping on that alone parks the model for
+// every second frame. Rotating through several slots makes a slot's previous use several frames
+// old, where the fence has long been signalled. The RenoDX hook makes the same choice ("one
+// command slot per backbuffer").
+constexpr int kPresentSlots = 4;
+
+struct PresentSlot
+{
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    unsigned long long fenceValue = 0;
+};
+
+PresentSlot g_presentSlots[kPresentSlots];
+int g_presentSlotIdx = 0;
 ID3D12Fence* g_presentFence = nullptr;
 ID3D12Device* g_presentDevice = nullptr;
 unsigned long long g_presentFenceValue = 0;
@@ -1526,16 +1540,21 @@ unsigned long long g_presentFenceValue = 0;
 // device the backbuffer belongs to is not the one these were built on.
 void ReleasePresentExecutor()
 {
-    if (g_presentList != nullptr)
+    for (auto& slot : g_presentSlots)
     {
-        g_presentList->Release();
-        g_presentList = nullptr;
-    }
+        if (slot.list != nullptr)
+        {
+            slot.list->Release();
+            slot.list = nullptr;
+        }
 
-    if (g_presentAllocator != nullptr)
-    {
-        g_presentAllocator->Release();
-        g_presentAllocator = nullptr;
+        if (slot.allocator != nullptr)
+        {
+            slot.allocator->Release();
+            slot.allocator = nullptr;
+        }
+
+        slot.fenceValue = 0;
     }
 
     if (g_presentFence != nullptr)
@@ -1545,6 +1564,7 @@ void ReleasePresentExecutor()
     }
 
     g_presentDevice = nullptr;
+    g_presentSlotIdx = 0;
     g_presentFenceValue = 0;
 }
 
@@ -1553,29 +1573,32 @@ bool EnsurePresentExecutor(ID3D12Device* device)
     if (g_presentDevice != device)
         ReleasePresentExecutor();
 
-    if (g_presentAllocator == nullptr &&
-        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                              IID_PPV_ARGS(&g_presentAllocator))))
+    for (auto& slot : g_presentSlots)
     {
-        g_presentAllocator = nullptr;
-        return false;
-    }
-
-    if (g_presentList == nullptr)
-    {
-        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_presentAllocator,
-                                             nullptr, IID_PPV_ARGS(&g_presentList))))
+        if (slot.allocator == nullptr &&
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(&slot.allocator))))
         {
-            g_presentList = nullptr;
+            slot.allocator = nullptr;
             return false;
         }
 
-        // Born open; the per-present cycle of Reset -> record -> Close assumes it starts closed.
-        if (FAILED(g_presentList->Close()))
+        if (slot.list == nullptr)
         {
-            g_presentList->Release();
-            g_presentList = nullptr;
-            return false;
+            if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator,
+                                                 nullptr, IID_PPV_ARGS(&slot.list))))
+            {
+                slot.list = nullptr;
+                return false;
+            }
+
+            // Born open; the per-present cycle of Reset -> record -> Close assumes it starts closed.
+            if (FAILED(slot.list->Close()))
+            {
+                slot.list->Release();
+                slot.list = nullptr;
+                return false;
+            }
         }
     }
 
@@ -3213,8 +3236,6 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
     // frame look like this frame's guides next time around.
     g_nr.presentValid = false;
 
-    LOG_INFO("NRTRACE EvalAtPresent sc={:X} idx={} scDesc", (size_t) swapChain, backbufferIndex);
-
     const D3D12_RESOURCE_DESC bbDesc = backbuffer->GetDesc();
     const auto width = (unsigned int) bbDesc.Width;
     const auto height = bbDesc.Height;
@@ -3247,24 +3268,30 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
         return;
     }
 
-    // The previous present's list still running is nearly impossible a whole frame later, but the
-    // check is one read against the rare stall of the swapchain's thread -- so the frame simply
-    // goes without the model. Same answer the RenoDX hook gives a busy slot.
-    if (g_presentFence->GetCompletedValue() < g_presentFenceValue)
+    // Rotate to the next slot and reuse it only if its previous list has retired. A busy slot
+    // costs this frame the model rather than stalling the swapchain's thread -- the same answer
+    // the RenoDX hook gives. With a slot per several frames that answer stays rare: in a deep
+    // pipeline the single-slot version of this skipped every second present.
+    g_presentSlotIdx = (g_presentSlotIdx + 1) % kPresentSlots;
+    PresentSlot& slot = g_presentSlots[g_presentSlotIdx];
+
+    if (g_presentFence->GetCompletedValue() < slot.fenceValue)
     {
         static unsigned long long skipped = 0;
 
         if (++skipped <= 3 || skipped % 300 == 0)
-            LOG_INFO("DLSS-NR present hook: last present's list is still in flight, skipping ({})",
-                     skipped);
+            LOG_INFO("DLSS-NR present hook: slot {}'s last list is still in flight, skipping ({})",
+                     g_presentSlotIdx, skipped);
 
         device->Release();
         backbuffer->Release();
         return;
     }
 
-    g_presentAllocator->Reset();
-    g_presentList->Reset(g_presentAllocator, nullptr);
+    slot.allocator->Reset();
+    slot.list->Reset(slot.allocator, nullptr);
+
+    ID3D12GraphicsCommandList* cmdList = slot.list;
 
     if (g_gpuTime == nullptr)
         g_gpuTime = std::make_unique<GpuTime_Dx12>(device);
@@ -3273,23 +3300,23 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
         g_ngxTime = std::make_unique<GpuTime_Dx12>(device);
 
     // The backbuffer arrives in PRESENT; the model reads it as a texture.
-    Barrier(g_presentList, backbuffer, D3D12_RESOURCE_STATE_PRESENT,
+    Barrier(cmdList, backbuffer, D3D12_RESOURCE_STATE_PRESENT,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     if (g_gpuTime != nullptr)
-        g_gpuTime->Start(g_presentList);
+        g_gpuTime->Start(cmdList);
 
     // Stays false while EnsurePresentFeature is mid-create: the frame that builds the feature is
     // submitted carrying only these barriers, and the first evaluate rides the next frame.
     bool wroteFrame = false;
 
-    if (EnsurePresentFeature(device, g_presentList, width, height, bbDesc.Format))
+    if (EnsurePresentFeature(device, cmdList, width, height, bbDesc.Format))
     {
         TickNrRetired();
         ++g_frames;
 
         if (g_ngxTime != nullptr)
-            g_ngxTime->Start(g_presentList);
+            g_ngxTime->Start(cmdList);
 
         // The finished frame is the input and the scratch is the answer, at its own full size --
         // the model sees exactly what the display would have shown, and the guide pair is what the
@@ -3301,7 +3328,7 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
         SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
 
         const int result = g_nr.evaluate(
-            g_presentList, g_nr.feature, g_nr.capabilityParams, backbuffer, g_nr.presentDepth,
+            cmdList, g_nr.feature, g_nr.capabilityParams, backbuffer, g_nr.presentDepth,
             g_nr.presentMotion, g_nr.output, width, height, g_nr.presentGuideWidth,
             g_nr.presentGuideHeight, g_nr.presentMotionWidth, g_nr.presentMotionHeight,
             frame.DepthSubrectBaseX, frame.DepthSubrectBaseY, frame.MotionSubrectBaseX,
@@ -3312,7 +3339,7 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
             cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, frame.MvScaleX, frame.MvScaleY);
 
         if (g_ngxTime != nullptr)
-            g_ngxTime->End(g_presentList);
+            g_ngxTime->End(cmdList);
 
         g_nr.reset = false;
 
@@ -3328,28 +3355,26 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
         {
             // The answer replaces the frame wholesale: this is the finished picture either way,
             // and a strength blend would need the composition the hook method exists to avoid.
-            Barrier(g_presentList, backbuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            Barrier(cmdList, backbuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_COPY_DEST);
-            Barrier(g_presentList, g_nr.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            Barrier(cmdList, g_nr.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_COPY_SOURCE);
-            g_presentList->CopyResource(backbuffer, g_nr.output);
-            Barrier(g_presentList, g_nr.output, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            cmdList->CopyResource(backbuffer, g_nr.output);
+            Barrier(cmdList, g_nr.output, D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            Barrier(g_presentList, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST,
+            Barrier(cmdList, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT);
             wroteFrame = true;
         }
-
-        LOG_INFO("NRTRACE evaluated, wroteFrame={}", wroteFrame);
     }
 
     if (!wroteFrame)
-        Barrier(g_presentList, backbuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        Barrier(cmdList, backbuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_PRESENT);
 
     if (g_gpuTime != nullptr)
     {
-        g_gpuTime->End(g_presentList);
+        g_gpuTime->End(cmdList);
 
         if (cfg.ShowFps.value_or_default() || State::Instance().menuVisible)
         {
@@ -3364,7 +3389,7 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
         }
     }
 
-    const HRESULT closeResult = g_presentList->Close();
+    const HRESULT closeResult = slot.list->Close();
 
     if (FAILED(closeResult))
     {
@@ -3378,8 +3403,10 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
 
     // On the presenting queue, inside the game's own Present -- everything the game recorded for
     // this frame is ahead of it and everything frame generation submits for it is behind.
-    queue->ExecuteCommandLists(1, (ID3D12CommandList**) &g_presentList);
-    queue->Signal(g_presentFence, ++g_presentFenceValue);
+    ID3D12CommandList* submit = slot.list;
+    queue->ExecuteCommandLists(1, &submit);
+    slot.fenceValue = ++g_presentFenceValue;
+    queue->Signal(g_presentFence, slot.fenceValue);
 
     device->Release();
     backbuffer->Release();

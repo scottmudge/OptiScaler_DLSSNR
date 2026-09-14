@@ -398,23 +398,12 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         State::Instance().frameCount = _frameCounter;
     }
 
-    // DLSS-NR's present hook (DlssNrHookMethod = Present). This swapchain's backbuffer is the
-    // frame that actually reaches the display, so this is where the model edits it.
-    //
-    // With frame generation, presents come here twice over: the base frame's own present (nested
-    // inside FGHooks::FGPresent, which marks it with fgBasePresentInFlight) and each generated
-    // frame's present afterwards (from FG's own thread, unmarked). The model runs on the base
-    // frame only -- generated frames are interpolation of edited frames, and paying the model's
-    // cost for each of them is the whole thing this hook exists to avoid. With no FG there is no
-    // marker and every present is a base frame's.
-    const bool nrBasePresent = State::Instance().currentFGSwapchain == nullptr ||
-                               State::Instance().fgBasePresentInFlight;
-
-    if (willPresent)
-        LOG_INFO("NRTRACE LocalPresent pSwapChain={:X} base={} fgSc={:X}",
-                 (size_t) pSwapChain, nrBasePresent, (size_t) State::Instance().currentFGSwapchain);
-
-    if (willPresent && nrBasePresent && State::Instance().swapchainApi == DX12)
+    // DLSS-NR's present hook (DlssNrHookMethod = Present), for the no-FG case only. With an FG
+    // swapchain this same present funnels into FGHooks::FGPresent, which is where the pass runs --
+    // and running it from both would edit the frame twice. (The other way to read this: this path
+    // is not just "no FG", it is "no FG swapchain hook at all".)
+    if (willPresent && State::Instance().currentFGSwapchain == nullptr &&
+        State::Instance().swapchainApi == DX12)
         DlssNr::EvaluateAtPresent(pSwapChain, State::Instance().currentCommandQueue);
 
     LOG_DEBUG("Calling original present");

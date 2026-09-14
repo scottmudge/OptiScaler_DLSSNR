@@ -1216,6 +1216,14 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
         }
     }
 
+    // DLSS-NR's present hook runs here, on the swapchain the game itself presents, ahead of frame
+    // generation's dispatch: the model edits the finished base frame's backbuffer, and FG only
+    // ever interpolates edited frames. (The wrapped-swapchain LocalPresent nested inside the real
+    // Present below is NOT used for this: with DLSSG active the displays pass through Streamline's
+    // own chain on other threads, so that point almost never sees the base frame.)
+    if (willPresent && state.swapchainApi == DX12)
+        DlssNr::EvaluateAtPresent(This, state.currentCommandQueue);
+
     if (willPresent && fgFeatureActive)
     {
         if (state.activeFgInput == FGInput::FSRFG)
@@ -1270,22 +1278,11 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     if (willPresent)
         state.fgPresentIsCalled = true;
 
-    // The real present below re-enters the wrapped swapchain's LocalPresent carrying this frame.
-    // Mark it, so DLSS-NR's present hook (which runs from LocalPresent, on the swapchain whose
-    // backbuffer actually reaches the screen) can tell this base-frame present apart from the
-    // generated frames' presents that arrive unnested.
-    state.fgBasePresentInFlight = true;
-
-    if (willPresent)
-        LOG_INFO("NRTRACE FGPresent real frame, This={:X}", (size_t) This);
-
     HRESULT result;
     if (pPresentParameters == nullptr)
         result = o_FGSCPresent(This, SyncInterval, Flags);
     else
         result = o_FGSCPresent1((IDXGISwapChain1*) This, SyncInterval, Flags, pPresentParameters);
-
-    state.fgBasePresentInFlight = false;
 
     if (result == S_OK)
     {
