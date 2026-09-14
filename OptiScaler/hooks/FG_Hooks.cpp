@@ -1276,6 +1276,9 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     // generated frames' presents that arrive unnested.
     state.fgBasePresentInFlight = true;
 
+    if (willPresent)
+        LOG_INFO("NRTRACE FGPresent real frame, This={:X}", (size_t) This);
+
     HRESULT result;
     if (pPresentParameters == nullptr)
         result = o_FGSCPresent(This, SyncInterval, Flags);

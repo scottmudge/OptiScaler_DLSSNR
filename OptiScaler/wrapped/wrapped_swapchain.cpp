@@ -410,6 +410,10 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     const bool nrBasePresent = State::Instance().currentFGSwapchain == nullptr ||
                                State::Instance().fgBasePresentInFlight;
 
+    if (willPresent)
+        LOG_INFO("NRTRACE LocalPresent pSwapChain={:X} base={} fgSc={:X}",
+                 (size_t) pSwapChain, nrBasePresent, (size_t) State::Instance().currentFGSwapchain);
+
     if (willPresent && nrBasePresent && State::Instance().swapchainApi == DX12)
         DlssNr::EvaluateAtPresent(pSwapChain, State::Instance().currentCommandQueue);
 

@@ -3213,6 +3213,8 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
     // frame look like this frame's guides next time around.
     g_nr.presentValid = false;
 
+    LOG_INFO("NRTRACE EvalAtPresent sc={:X} idx={} scDesc", (size_t) swapChain, backbufferIndex);
+
     const D3D12_RESOURCE_DESC bbDesc = backbuffer->GetDesc();
     const auto width = (unsigned int) bbDesc.Width;
     const auto height = bbDesc.Height;
@@ -3337,6 +3339,8 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
                     D3D12_RESOURCE_STATE_PRESENT);
             wroteFrame = true;
         }
+
+        LOG_INFO("NRTRACE evaluated, wroteFrame={}", wroteFrame);
     }
 
     if (!wroteFrame)
