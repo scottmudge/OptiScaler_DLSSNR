@@ -398,11 +398,19 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         State::Instance().frameCount = _frameCounter;
     }
 
-    // DLSS-NR's present hook (DlssNrHookMethod = Present). Only here when no FG swapchain exists
-    // to route through: with one, the real Present below lands in FGHooks::FGPresent, which runs
-    // the pass itself ahead of frame generation -- running it in both would do the model's edit
-    // twice to the same frame.
-    if (willPresent && State::Instance().currentFGSwapchain == nullptr && State::Instance().swapchainApi == DX12)
+    // DLSS-NR's present hook (DlssNrHookMethod = Present). This swapchain's backbuffer is the
+    // frame that actually reaches the display, so this is where the model edits it.
+    //
+    // With frame generation, presents come here twice over: the base frame's own present (nested
+    // inside FGHooks::FGPresent, which marks it with fgBasePresentInFlight) and each generated
+    // frame's present afterwards (from FG's own thread, unmarked). The model runs on the base
+    // frame only -- generated frames are interpolation of edited frames, and paying the model's
+    // cost for each of them is the whole thing this hook exists to avoid. With no FG there is no
+    // marker and every present is a base frame's.
+    const bool nrBasePresent = State::Instance().currentFGSwapchain == nullptr ||
+                               State::Instance().fgBasePresentInFlight;
+
+    if (willPresent && nrBasePresent && State::Instance().swapchainApi == DX12)
         DlssNr::EvaluateAtPresent(pSwapChain, State::Instance().currentCommandQueue);
 
     LOG_DEBUG("Calling original present");

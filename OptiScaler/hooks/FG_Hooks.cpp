@@ -1216,12 +1216,6 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
         }
     }
 
-    // DLSS-NR's present hook runs here, ahead of frame generation's dispatch: the model edits the
-    // finished backbuffer while it is still a base frame, and FG only ever sees the edited result.
-    // A no-op unless HookMethod = Present (DlssNrHookMethod) is set.
-    if (willPresent)
-        DlssNr::EvaluateAtPresent(This, state.currentCommandQueue);
-
     if (willPresent && fgFeatureActive)
     {
         if (state.activeFgInput == FGInput::FSRFG)
@@ -1276,11 +1270,19 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     if (willPresent)
         state.fgPresentIsCalled = true;
 
+    // The real present below re-enters the wrapped swapchain's LocalPresent carrying this frame.
+    // Mark it, so DLSS-NR's present hook (which runs from LocalPresent, on the swapchain whose
+    // backbuffer actually reaches the screen) can tell this base-frame present apart from the
+    // generated frames' presents that arrive unnested.
+    state.fgBasePresentInFlight = true;
+
     HRESULT result;
     if (pPresentParameters == nullptr)
         result = o_FGSCPresent(This, SyncInterval, Flags);
     else
         result = o_FGSCPresent1((IDXGISwapChain1*) This, SyncInterval, Flags, pPresentParameters);
+
+    state.fgBasePresentInFlight = false;
 
     if (result == S_OK)
     {
