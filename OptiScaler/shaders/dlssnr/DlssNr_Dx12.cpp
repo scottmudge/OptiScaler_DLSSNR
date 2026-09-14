@@ -3147,7 +3147,19 @@ void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
     const Config& cfg = *Config::Instance();
 
     if (!cfg.DlssNrEnabled.value_or_default() || cfg.DlssNrHookMethod.value_or_default() != 1)
+    {
+        // Off entirely, or the hook elsewhere: a capture from a previous on-period is describing
+        // a frame that has since moved on, and the first evaluate after re-enabling would read
+        // those guides without the reset the gap demands. Drop it rather than keep it warm.
+        if (g_nr.presentValid)
+        {
+            std::lock_guard<std::mutex> nrLock(g_nrMutex);
+            g_nr.presentValid = false;
+            g_nr.reset = true;
+        }
+
         return;
+    }
 
     NoteHookMethod(1);
 
