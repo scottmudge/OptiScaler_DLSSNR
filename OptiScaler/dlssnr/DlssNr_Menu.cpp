@@ -108,10 +108,37 @@ void RenderMenu(Config* config, float menuResScale)
         if (ImGui::Checkbox("Apply the model", &applyModel))
             config->DlssNrApplyModel = applyModel;
 
-        HelpMarker("Whether the model's edit is applied. Off shows the clean upscaler frame while the"
-                       "\npass keeps running -- so with Hold frame (under Compare) you can freeze a"
-                       "\nframe and toggle this to see the same frozen frame with and without Neural"
-                       "\nRendering. Leave it on for normal use.");
+        HelpMarker("Whether the model's edit is applied. Off shows the clean frame while the"
+                       "\npass keeps running -- so with Hold frame (under Compare, after-the-upscaler"
+                       "\nhook only) you can freeze a frame and toggle this to see the same frozen"
+                       "\nframe with and without Neural Rendering. Leave it on for normal use.");
+
+        // Where the pass sits. The classic seam edits the upscaler's pre-tonemap output in place
+        // and needs the whole colour apparatus below; the present hook edits the finished frame
+        // and needs none of it.
+        static const char* hookNames[] = { "After the upscaler", "At present" };
+        int hook = (int) config->DlssNrHookMethod.value_or_default();
+
+        if (hook < 0 || hook > 1)
+            hook = 0;
+
+        if (ImGui::Combo("Hook method", &hook, hookNames, IM_ARRAYSIZE(hookNames)))
+            config->DlssNrHookMethod = (uint32_t) hook;
+
+        HelpMarker("After the upscaler -- the classic path. The model runs on the upscaler's"
+                       "\noutput the moment it is produced, before the game's post-processing and"
+                       "\ninterface are drawn. That frame is LINEAR and open-ended there, not the"
+                       "\npicture the display will show, so everything under \"Colour\" below exists"
+                       "\nto say where white sits in it."
+                       "\n\nAt present -- the hook the RenoDX DLSS addon uses. The model runs on the"
+                       "\nfinished frame the game is presenting, tone mapping and interface included,"
+                       "\nin its place in the queue just before frame generation. The frame is"
+                       "\nalready the display's picture, so none of the white point / exposure"
+                       "\nwork applies and it is all hidden. DirectX 12 only; the frame generation"
+                       "\npasses run afterwards, on the edited frame, and only base frames pay the"
+                       "\nmodel's cost, not every generated one.");
+
+        const bool atPresent = config->DlssNrHookMethod.value_or_default() == 1;
 
         // Either backend. The two keep separate state, and on a native Vulkan game the D3D12 side
         // is never touched -- so asking only that one reports "waiting for the upscaler" over a pass
@@ -178,6 +205,11 @@ void RenderMenu(Config* config, float menuResScale)
         ImGui::Spacing();
         ImGui::PushItemWidth(220.0f * menuResScale);
 
+        // In the present hook the model always works at the frame's own size -- there is no proxy
+        // and no resolve to bring a shrunken answer back with, so the scaling controls stay with
+        // the hook that has them.
+        if (!atPresent)
+        {
         // Any percentage, rather than a handful of steps somebody chose in advance. The lower bound
         // is 25%: below that the model is working on so little of the picture that its answer no
         // longer survives being enlarged onto it.
@@ -266,7 +298,12 @@ void RenderMenu(Config* config, float menuResScale)
                        "\nidentical (supersampling brings its answer down to frame size before this)."
                        "\n\nFrom hhkbble's multi-pass work on this fork.");
         }
+        } // !atPresent -- model resolution and enlargement
 
+        // The composition strengths belong to the after-the-upscaler pass too: the present hook
+        // copies the model's answer back whole, so there is nothing for these to scale.
+        if (!atPresent)
+        {
         ImGui::SeparatorText("How much of it lands");
 
         float transfer = config->DlssNrTransferStrength.value_or_default();
@@ -339,6 +376,7 @@ void RenderMenu(Config* config, float menuResScale)
                        "\nbright highlights instead of everywhere. Most of Replace's detail, far more"
                        "\nstable. If you love the Replace look but the flicker bothers you, use this."
                        "\n\nOff is byte-identical to before.");
+        } // !atPresent -- composition strengths
 
         ImGui::SeparatorText("Model");
 
@@ -393,6 +431,11 @@ void RenderMenu(Config* config, float menuResScale)
 
         HelpMarker("Lets the model find skin itself rather than treating the frame uniformly.");
 
+        // The whole colour section is about mapping a pre-tonemap frame into the model's range.
+        // The present hook never has such a frame: its input IS the finished picture, so white
+        // point, exposure and the scan are all bypassed and hidden with it.
+        if (!atPresent)
+        {
         ImGui::SeparatorText("Colour");
 
         ImGui::TextDisabled("The model was trained on finished, sRGB-encoded frames. The upscaler's\n"
@@ -959,7 +1002,12 @@ void RenderMenu(Config* config, float menuResScale)
 
 
         }
+        } // !atPresent -- white point / exposure / the scan
 
+        // Compare, hold and the debug views all live in the resolve pass, which the present hook
+        // never runs -- the model's answer is copied over the backbuffer whole.
+        if (!atPresent)
+        {
         ImGui::SeparatorText("Compare");
 
         // Freeze the frame the model works on, so a setting change re-renders it in place -- the only
@@ -1058,6 +1106,7 @@ void RenderMenu(Config* config, float menuResScale)
                        "\nis wrong and nothing downstream can be judged."
                        "\n\nDifference shows what the model actually changed, amplified twenty times and"
                        "\ncentred on grey. A flat grey frame there means it is doing nothing.");
+        } // !atPresent -- compare and the debug views
 
         ImGui::PopItemWidth();
     }

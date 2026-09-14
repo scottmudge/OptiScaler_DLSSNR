@@ -257,6 +257,12 @@ class Config
     // DLSS Neural Rendering: a detail-synthesis pass over the upscaler's output. Off by default -- it is
     // an undocumented feature driven directly through its snippet, not something NVIDIA exposes.
     CustomOptional<bool> DlssNrEnabled { false };
+    // Where the pass hooks in. 0 = after the upscaler, on its pre-tonemap output (the classic path;
+    // needs the whole white-point/exposure machinery below). 1 = at present, on the swapchain's
+    // finished backbuffer, mirroring the RenoDX addon's "Present" hook -- the frame is already
+    // tone-mapped there, so the model is fed it directly and its answer is copied straight back,
+    // and all the colour/white-point machinery is bypassed. Direct3D 12 only; other APIs keep path 0.
+    CustomOptional<uint32_t> DlssNrHookMethod { 0 };
     // Toggles the pass in game. Unbound by default -- a key that does something unexpected is worse
     // than one that does nothing.
     CustomOptional<int> DlssNrToggleKey { UnboundKey };

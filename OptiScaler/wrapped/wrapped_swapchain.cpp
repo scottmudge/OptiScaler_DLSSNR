@@ -16,6 +16,7 @@
 #include <d3d12.h>
 #include <misc/IdentifyGpu.h>
 #include <hooks/Xell_Hooks.h>
+#include <dlssnr/DlssNrFeature_Dx12.h>
 
 #ifdef LOW_LATENCY_INPUTS
 #include <low_latency/input/input_antilag2.h>
@@ -396,6 +397,13 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         _frameCounter++;
         State::Instance().frameCount = _frameCounter;
     }
+
+    // DLSS-NR's present hook (DlssNrHookMethod = Present). Only here when no FG swapchain exists
+    // to route through: with one, the real Present below lands in FGHooks::FGPresent, which runs
+    // the pass itself ahead of frame generation -- running it in both would do the model's edit
+    // twice to the same frame.
+    if (willPresent && State::Instance().currentFGSwapchain == nullptr && State::Instance().swapchainApi == DX12)
+        DlssNr::EvaluateAtPresent(pSwapChain, State::Instance().currentCommandQueue);
 
     LOG_DEBUG("Calling original present");
 

@@ -312,6 +312,29 @@ struct NrState
     ID3D12Resource* depthClone = nullptr;
     ID3D12Resource* motionClone = nullptr;
 
+    // The present hook's own copies of the guides, taken on the game's command list at the
+    // upscale evaluate and read by the model at the present. Cloned unconditionally, not only for
+    // typeless formats like depthClone/motionClone above: the game is free to reuse its own depth
+    // and motion targets between the upscaler and the present, and by the time the present runs
+    // the only frame-left version of the guides is the one we took.
+    //
+    // One copy apiece is enough when the capture and the evaluate land on the same queue, which
+    // is the assumption built on: the capture's copies are recorded into the game's rendering
+    // list and the evaluate into the present list on the swapchain's creation queue, and the one
+    // queue serialises them. A game that upscales on a queue it does not present from would need
+    // a fence between the two; none has shown up yet.
+    ID3D12Resource* presentDepth = nullptr;
+    ID3D12Resource* presentMotion = nullptr;
+
+    // Everything the present needs from the upscale evaluate. One frame of depth only: a present
+    // consumes it (valid goes false), and a frame the upscaler never ran on presents unchanged.
+    bool presentValid = false;
+    DlssNrFrameInfo presentFrame {};
+    unsigned int presentGuideWidth = 0;
+    unsigned int presentGuideHeight = 0;
+    unsigned int presentMotionWidth = 0;
+    unsigned int presentMotionHeight = 0;
+
     // The constant-depth probe's surface. Separate from depthClone on purpose: it is defined by
     // never having been written, and sharing a surface with a mode that writes would destroy that.
     ID3D12Resource* depthConstant = nullptr;
@@ -1208,6 +1231,85 @@ ID3D12Resource* ReadableGuide(ID3D12Device* device, ID3D12GraphicsCommandList* c
 
 // The upscaler's own names differ between super resolution and ray reconstruction, and only one set is
 // present on any given block.
+
+// All the places in one guide pair the frame and its encoding say to cut out of them: the texture's
+// own extent trimmed by what the game actually rendered, the base of each subrect, and the motion
+// vectors' separate size when they run at render resolution against a display-size frame.
+//
+// Shared by the upscaler-seam pass and the present hook's capture, so the two always tell the model
+// the same numbers about the same textures.
+struct GuideRegion
+{
+    unsigned int guideWidth = 0, guideHeight = 0;
+    unsigned int depthBaseX = 0, depthBaseY = 0;
+    unsigned int motionWidth = 0, motionHeight = 0;
+    unsigned int motionBaseX = 0, motionBaseY = 0;
+};
+
+GuideRegion ResolveGuideRegion(const DlssNrFrameInfo& frame, ID3D12Resource* depth,
+                               ID3D12Resource* motion, unsigned int width, unsigned int height)
+{
+    GuideRegion region {};
+
+    // Sizes come from the resources rather than from the caller: one less thing a call site can get
+    // wrong, and the model takes the difference as a subrect per resource rather than needing
+    // anything resampled.
+    const D3D12_RESOURCE_DESC guideDesc = depth->GetDesc();
+    const D3D12_RESOURCE_DESC motionDesc = motion->GetDesc();
+    region.guideWidth = (unsigned int) guideDesc.Width;
+    region.guideHeight = guideDesc.Height;
+
+    if (region.guideWidth == 0 || region.guideHeight == 0)
+    {
+        region.guideWidth = width;
+        region.guideHeight = height;
+    }
+
+    // What the game rendered wins over how big the texture is. A dynamic resolution title allocates
+    // its depth once at the maximum it will ever need and renders into the corner; the resource then
+    // describes the allocation, not the picture, and the model gets handed the stale margin as
+    // though it were scene. Bounded by the resource because a subrect larger than the texture is a
+    // game bug that would otherwise become a read off the end of it.
+    if (frame.RenderSubrectWidth != 0 && frame.RenderSubrectHeight != 0)
+    {
+        const unsigned int subW = std::min(frame.RenderSubrectWidth, region.guideWidth);
+        const unsigned int subH = std::min(frame.RenderSubrectHeight, region.guideHeight);
+
+        if (subW != region.guideWidth || subH != region.guideHeight)
+        {
+            static unsigned int saidW = 0, saidH = 0;
+
+            if (saidW != subW || saidH != subH)
+            {
+                saidW = subW;
+                saidH = subH;
+                LOG_INFO("DLSS-NR guides: the game renders {}x{} into a {}x{} texture, so the model is "
+                         "told the smaller number",
+                         subW, subH, region.guideWidth, region.guideHeight);
+            }
+        }
+
+        region.guideWidth = subW;
+        region.guideHeight = subH;
+    }
+
+    region.depthBaseX = std::min(frame.DepthSubrectBaseX, (unsigned int) guideDesc.Width);
+    region.depthBaseY = std::min(frame.DepthSubrectBaseY, guideDesc.Height);
+    region.guideWidth = std::min(region.guideWidth, (unsigned int) guideDesc.Width - region.depthBaseX);
+    region.guideHeight = std::min(region.guideHeight, guideDesc.Height - region.depthBaseY);
+
+    region.motionBaseX = std::min(frame.MotionSubrectBaseX, (unsigned int) motionDesc.Width);
+    region.motionBaseY = std::min(frame.MotionSubrectBaseY, motionDesc.Height);
+    const unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution ? region.guideWidth : width;
+    const unsigned int wantedMotionHeight =
+        frame.MotionVectorsLowResolution ? region.guideHeight : height;
+    region.motionWidth =
+        std::min(wantedMotionWidth, (unsigned int) motionDesc.Width - region.motionBaseX);
+    region.motionHeight = std::min(wantedMotionHeight, motionDesc.Height - region.motionBaseY);
+
+    return region;
+}
+
 // Whether a surface can physically hold linear HDR.
 //
 // Only a float format can: linear light is open-ended and runs far past 1.0, which a normalised
@@ -1355,6 +1457,341 @@ void ReportSkipOnce(const char* reason)
 
     if (seen.insert(reason).second)
         LOG_INFO("DLSS-NR did not run: {}", reason);
+}
+
+// ---------------------------------------------------------------------------
+// The present hook (DlssNrHookMethod = 1)
+//
+// Where the pass sits when "Hook method: Present" is chosen: not on the upscaler's seam but on the
+// swapchain's finished frame, the way the RenoDX DLSS addon's "Present" hook does it. The upscale
+// evaluate only CLONES the guides (the game is free to reuse its depth and motion targets before
+// the frame is presented, so the one trustworthy copy is ours) and the present itself runs the
+// model over the backbuffer and copies the answer back into it -- nothing else. No proxy, no tone
+// curve, no white point, no composition: the frame the model is shown is the frame the display
+// would have shown, which is precisely why none of those are needed on this path.
+// ---------------------------------------------------------------------------
+
+// The hook the running state was built around last, so a change of the setting at playtime is
+// noticed and everything sized to the other seam goes away. UINT32_MAX until anything runs.
+unsigned int g_nrHook = UINT32_MAX;
+
+// Called with no lock held, from the two entry points.
+//
+// A hook change throws away the feature and every surface: the model's history was built out of a
+// frame that stops existing in the shape it knew (pre-tonemap, no interface versus the finished
+// backbuffer), so keeping it would hand the rebuild a poisoned history regardless.
+void NoteHookMethod(unsigned int hook)
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
+    if (hook == g_nrHook)
+        return;
+
+    if (g_nrHook == UINT32_MAX)
+    {
+        g_nrHook = hook;
+        return;
+    }
+
+    LOG_INFO("DLSS-NR hook method changed ({} -> {}): rebuilding the model and its surfaces",
+             g_nrHook, hook);
+    g_nrHook = hook;
+
+    ParkNrFeature(g_nr.feature);
+
+    for (void*& f : g_nr.passFeature)
+        ParkNrFeature(f);
+
+    for (ID3D12Resource** r :
+         { &g_nr.output, &g_nr.colorCopy, &g_nr.hdrCopy, &g_nr.colorSmall, &g_nr.outputNative,
+           &g_nr.presentDepth, &g_nr.presentMotion })
+        ParkNrResource(*r);
+
+    g_nr.presentValid = false;
+    g_nr.reset = true;
+}
+
+// The present hook's recording machinery: one allocator, one list, one fence, executed on the
+// presenting queue inside the game's own Present call. A single set is enough because the pass
+// records and submits exactly once per present, and the fence from the previous present is long
+// retired by the time the next comes around -- if it somehow is not, that present goes without
+// the model rather than stalling the frame on the swapchain's thread.
+ID3D12CommandAllocator* g_presentAllocator = nullptr;
+ID3D12GraphicsCommandList* g_presentList = nullptr;
+ID3D12Fence* g_presentFence = nullptr;
+ID3D12Device* g_presentDevice = nullptr;
+unsigned long long g_presentFenceValue = 0;
+
+// Releases the above. Also the answer to the device being recreated mid-session: called when the
+// device the backbuffer belongs to is not the one these were built on.
+void ReleasePresentExecutor()
+{
+    if (g_presentList != nullptr)
+    {
+        g_presentList->Release();
+        g_presentList = nullptr;
+    }
+
+    if (g_presentAllocator != nullptr)
+    {
+        g_presentAllocator->Release();
+        g_presentAllocator = nullptr;
+    }
+
+    if (g_presentFence != nullptr)
+    {
+        g_presentFence->Release();
+        g_presentFence = nullptr;
+    }
+
+    g_presentDevice = nullptr;
+    g_presentFenceValue = 0;
+}
+
+bool EnsurePresentExecutor(ID3D12Device* device)
+{
+    if (g_presentDevice != device)
+        ReleasePresentExecutor();
+
+    if (g_presentAllocator == nullptr &&
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              IID_PPV_ARGS(&g_presentAllocator))))
+    {
+        g_presentAllocator = nullptr;
+        return false;
+    }
+
+    if (g_presentList == nullptr)
+    {
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_presentAllocator,
+                                             nullptr, IID_PPV_ARGS(&g_presentList))))
+        {
+            g_presentList = nullptr;
+            return false;
+        }
+
+        // Born open; the per-present cycle of Reset -> record -> Close assumes it starts closed.
+        if (FAILED(g_presentList->Close()))
+        {
+            g_presentList->Release();
+            g_presentList = nullptr;
+            return false;
+        }
+    }
+
+    if (g_presentFence == nullptr &&
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_presentFence))))
+    {
+        g_presentFence = nullptr;
+        return false;
+    }
+
+    g_presentDevice = device;
+    return true;
+}
+
+// Copies one guide into the hook's own texture, whatever its format. ReadableGuide nearby only
+// clones a typeless guide and hands the original back otherwise, which is right for a pass that
+// runs before it returns -- the present hook runs a long list later, and by then the game may
+// have written anything into its own copy.
+bool CloneGuideForPresent(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList,
+                          ID3D12Resource* source, ID3D12Resource** clone)
+{
+    if (*clone != nullptr)
+    {
+        const D3D12_RESOURCE_DESC have = (*clone)->GetDesc();
+        const D3D12_RESOURCE_DESC want = source->GetDesc();
+
+        if (have.Width != want.Width || have.Height != want.Height ||
+            have.Format != TypedGuideFormat(want.Format))
+        {
+            // Retired, not released: the previous present may still be reading it.
+            ParkNrResource(*clone);
+        }
+    }
+
+    const bool fresh = *clone == nullptr;
+
+    if (fresh)
+    {
+        *clone = CreateGuideClone(device, source);
+
+        if (*clone == nullptr)
+            return false;
+    }
+
+    // NGX's contract is a guide in NON_PIXEL_SHADER_RESOURCE, which is the state the upscaler
+    // leaves its inputs in -- the same assumption ReadableGuide already makes of this call site.
+    // A fresh clone was BORN in COPY_DEST and skips the first barrier; after that it lives in
+    // NON_PIXEL_SHADER_RESOURCE between a capture and its present and goes round the loop.
+    Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    if (!fresh)
+        Barrier(cmdList, *clone, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+
+    cmdList->CopyResource(*clone, source);
+    Barrier(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(cmdList, *clone, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return true;
+}
+
+// The whole of what the upscale evaluate does when the present hook is chosen: capture the guides
+// and remember how they were shaped, and nothing more. The frame itself is not touched here --
+// the present works on the finished frame straight from the swapchain.
+void CaptureGuidesForPresent(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* target,
+                             ID3D12Resource* depth, ID3D12Resource* motion,
+                             const DlssNrFrameInfo& frame)
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
+    if (g_nr.failed)
+        return;
+
+    ID3D12Device* device = nullptr;
+
+    if (FAILED(depth->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+    {
+        device = nullptr;
+        ReportSkipOnce("present hook: the guides belong to no device");
+        return;
+    }
+
+    if (!CloneGuideForPresent(device, cmdList, depth, &g_nr.presentDepth) ||
+        !CloneGuideForPresent(device, cmdList, motion, &g_nr.presentMotion))
+    {
+        ParkNrResource(g_nr.presentDepth);
+        ParkNrResource(g_nr.presentMotion);
+        device->Release();
+        g_nr.failed = true;
+        g_nr.reason = "present hook: the guides could not be copied for the present";
+        LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
+        return;
+    }
+
+    const D3D12_RESOURCE_DESC targetDesc = target->GetDesc();
+    const GuideRegion region = ResolveGuideRegion(frame, depth, motion,
+                                                  (unsigned int) targetDesc.Width,
+                                                  targetDesc.Height);
+
+    g_nr.presentFrame = frame;
+    g_nr.presentGuideWidth = region.guideWidth;
+    g_nr.presentGuideHeight = region.guideHeight;
+    g_nr.presentMotionWidth = region.motionWidth;
+    g_nr.presentMotionHeight = region.motionHeight;
+
+    if (frame.Reset)
+        g_nr.reset = true;
+
+    g_nr.presentValid = true;
+
+    static bool saidCapture = false;
+
+    if (!saidCapture)
+    {
+        saidCapture = true;
+        LOG_INFO("DLSS-NR present hook: capturing guides at {}x{} for the present",
+                 region.guideWidth, region.guideHeight);
+    }
+
+    device->Release();
+}
+
+// Builds or rebuilds the model for the backbuffer in hand, mirroring the create-and-return-early
+// of the upscale path: the list carrying a creation is submitted before the first evaluate is
+// recorded, because creating and evaluating on one list is the sequence that hung the GPU.
+bool EnsurePresentFeature(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList,
+                          unsigned int width, unsigned int height, DXGI_FORMAT format)
+{
+    const Config& cfg = *Config::Instance();
+
+    if (!EnsureForwarder() || !EnsureCapabilityParams(device))
+    {
+        g_nr.failed = true;
+        LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
+        return false;
+    }
+
+    const bool resolutionChanged = g_nr.width != width || g_nr.height != height ||
+                                   (g_nr.output != nullptr && g_nr.output->GetDesc().Format != format) ||
+                                   g_nr.workWidth != width || g_nr.workHeight != height;
+
+    if (g_nr.feature != nullptr && (resolutionChanged || !TuningMatchesFeature(cfg)))
+    {
+        ParkNrFeature(g_nr.feature);
+
+        if (resolutionChanged)
+            ParkNrResource(g_nr.output);
+    }
+
+    if (g_nr.output == nullptr)
+    {
+        // The model's answer: same size and format as the backbuffer, copied back over it. UAV,
+        // because the model writes it.
+        g_nr.output = CreateScratch(device, format, width, height);
+        g_nr.workWidth = width;
+        g_nr.workHeight = height;
+    }
+
+    if (g_nr.output == nullptr)
+    {
+        g_nr.failed = true;
+        g_nr.reason = "present hook: the model's output texture could not be allocated";
+        LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
+        return false;
+    }
+
+    if (g_nr.feature != nullptr)
+        return true;
+
+    auto snippet = Util::FindFilePath(g_dllDir, "nvngx_dlssnr.dll");
+
+    if (!snippet.has_value())
+        snippet = Util::FindFilePath(Util::ExePath().remove_filename(), "nvngx_dlssnr.dll");
+
+    if (!snippet.has_value())
+    {
+        g_nr.failed = true;
+        g_nr.reason = "nvngx_dlssnr.dll was not found beside OptiScaler or the game";
+        LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
+        return false;
+    }
+
+    SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
+    g_nr.feature =
+        g_nr.create(snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
+                    device, cmdList, g_nr.capabilityParams, width, height,
+                    (int) cfg.DlssNrPreset.value_or_default(), cfg.DlssNrIntensity.value_or_default(),
+                    (int) cfg.DlssNrStyle.value_or_default(),
+                    cfg.DlssNrLocalStructure.value_or_default(), cfg.DlssNrLocalTone.value_or_default(),
+                    cfg.DlssNrSkinStructure.value_or_default(),
+                    cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, 1);
+
+    if (g_nr.feature == nullptr)
+    {
+        g_nr.failed = true;
+        g_nr.reason = "the model would not initialise";
+        const auto initResult = (unsigned int) (g_nr.lastInit != nullptr ? *g_nr.lastInit : 0);
+        const auto createResult = (unsigned int) (g_nr.lastCreate != nullptr ? *g_nr.lastCreate : 0);
+        LOG_ERROR("DLSS-NR create failed: init 0x{:X} ({}), create 0x{:X} ({})", initResult,
+                  NgxResultName(initResult), createResult, NgxResultName(createResult));
+        return false;
+    }
+
+    g_nr.width = width;
+    g_nr.height = height;
+    g_nr.reset = true;
+    RecordBuiltTuning(cfg);
+    LOG_INFO("DLSS-NR present hook: model running on the finished frame at {}x{}, guides "
+             "{}x{} (preset {}, intensity {}, style {})",
+             width, height, g_nr.presentGuideWidth, g_nr.presentGuideHeight, g_nr.builtPreset,
+             g_nr.builtIntensity, g_nr.builtStyle);
+
+    // Created this frame, evaluated from the next. See the note at the upscale path's creation.
+    return false;
 }
 
 } // namespace
@@ -1567,66 +2004,16 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // Depth and motion vectors are the upscaler's inputs and so are at render resolution, while colour
     // and output are at display resolution. The model takes that as a subrect per resource rather than
     // needing them resampled, which is why nothing here rescales anything.
-    // The guides are the upscaler's inputs and so are at render resolution, while colour and output
-    // are at display resolution. Their sizes come from the resources rather than from the caller:
-    // one less thing a call site can get wrong, and the model takes the difference as a subrect per
-    // resource rather than needing anything resampled.
-    const D3D12_RESOURCE_DESC guideDesc = depth->GetDesc();
-    const D3D12_RESOURCE_DESC motionDesc = motion->GetDesc();
-    unsigned int guideWidth = (unsigned int) guideDesc.Width;
-    unsigned int guideHeight = guideDesc.Height;
-
-    if (guideWidth == 0 || guideHeight == 0)
-    {
-        guideWidth = width;
-        guideHeight = height;
-    }
-
-    // What the game rendered wins over how big the texture is.
-    //
-    // The comment above says the sizes come from the resources so there is one less thing a call site
-    // can get wrong, and that was right about call sites and wrong about the game. A dynamic
-    // resolution title allocates its depth once at the maximum it will ever need and renders into
-    // the corner; the resource then describes the allocation, not the picture, and the model gets
-    // handed the stale margin as though it were scene.
-    //
-    // Bounded by the resource because a subrect larger than the texture is a game bug that would
-    // otherwise become a read off the end of it.
-    if (frame.RenderSubrectWidth != 0 && frame.RenderSubrectHeight != 0)
-    {
-        const unsigned int subW = std::min(frame.RenderSubrectWidth, guideWidth);
-        const unsigned int subH = std::min(frame.RenderSubrectHeight, guideHeight);
-
-        if (subW != guideWidth || subH != guideHeight)
-        {
-            static unsigned int saidW = 0, saidH = 0;
-
-            if (saidW != subW || saidH != subH)
-            {
-                saidW = subW;
-                saidH = subH;
-                LOG_INFO("DLSS-NR guides: the game renders {}x{} into a {}x{} texture, so the model is "
-                         "told the smaller number",
-                         subW, subH, guideWidth, guideHeight);
-            }
-        }
-
-        guideWidth = subW;
-        guideHeight = subH;
-    }
-
-    const unsigned int depthBaseX = std::min(frame.DepthSubrectBaseX, (unsigned int) guideDesc.Width);
-    const unsigned int depthBaseY = std::min(frame.DepthSubrectBaseY, guideDesc.Height);
-    guideWidth = std::min(guideWidth, (unsigned int) guideDesc.Width - depthBaseX);
-    guideHeight = std::min(guideHeight, guideDesc.Height - depthBaseY);
-
-    const unsigned int motionBaseX = std::min(frame.MotionSubrectBaseX, (unsigned int) motionDesc.Width);
-    const unsigned int motionBaseY = std::min(frame.MotionSubrectBaseY, motionDesc.Height);
-    const unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution ? guideWidth : width;
-    const unsigned int wantedMotionHeight = frame.MotionVectorsLowResolution ? guideHeight : height;
-    const unsigned int motionWidth =
-        std::min(wantedMotionWidth, (unsigned int) motionDesc.Width - motionBaseX);
-    const unsigned int motionHeight = std::min(wantedMotionHeight, motionDesc.Height - motionBaseY);
+    const GuideRegion region =
+        ResolveGuideRegion(frame, depth, motion, width, height);
+    const unsigned int guideWidth = region.guideWidth;
+    const unsigned int guideHeight = region.guideHeight;
+    const unsigned int depthBaseX = region.depthBaseX;
+    const unsigned int depthBaseY = region.depthBaseY;
+    const unsigned int motionBaseX = region.motionBaseX;
+    const unsigned int motionBaseY = region.motionBaseY;
+    const unsigned int motionWidth = region.motionWidth;
+    const unsigned int motionHeight = region.motionHeight;
 
     g_nr.guideWidth = guideWidth;
     g_nr.guideHeight = guideHeight;
@@ -2536,6 +2923,8 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         return;
     }
 
+    NoteHookMethod(Config::Instance()->DlssNrHookMethod.value_or_default());
+
     if (cmdList == nullptr || params == nullptr)
     {
         ReportSkipOnce("no command list or no parameter block");
@@ -2609,6 +2998,15 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
 
     if (params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &frame.MvScaleY) != NVSDK_NGX_Result_Success)
         frame.MvScaleY = 1.0f;
+
+    // The present hook's half of an evaluate: copy the guides aside and stop. The model runs at
+    // the present, on the finished frame -- never here, never on the pre-tonemap buffer.
+    if (Config::Instance()->DlssNrHookMethod.value_or_default() == 1)
+    {
+        CaptureGuidesForPresent(cmdList, target, depth, motion, frame);
+        return;
+    }
+
 
     // What the game says about its own exposure. Logged, used for nothing yet.
     //
@@ -2736,7 +3134,241 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     g_compose->Dispatch(cmdList, target, depth, motion, target, frame, timingQueue);
 }
 
-// The pass. Resources in, nothing read from anywhere the caller cannot see.
+// The present hook's other half (DlssNrHookMethod = 1). See the note on the capture above: the
+// guides were copied for this frame at the upscale evaluate, and here the model runs over the
+// swapchain's finished frame and its answer is copied straight back into the backbuffer. Nothing
+// else -- no proxy, no white point, no resolve -- because the frame is already the display's
+// picture, and every one of those existed to turn something else into it.
+//
+// Runs before frame generation is told the frame exists, so the generated frames stay the
+// interpolation of edited base frames and the model never runs on FG's own output.
+void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue)
+{
+    const Config& cfg = *Config::Instance();
+
+    if (!cfg.DlssNrEnabled.value_or_default() || cfg.DlssNrHookMethod.value_or_default() != 1)
+        return;
+
+    NoteHookMethod(1);
+
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
+    if (swapChain == nullptr || queue == nullptr)
+    {
+        ReportSkipOnce("present hook: no swapchain or no presenting queue");
+        return;
+    }
+
+    if (g_nr.failed)
+        return;
+
+    // No upscale evaluate seen since the last present -- nothing fresh to reproduce the frame's
+    // motion from, and running the model off a previous frame's guides is the definition of
+    // ghosting. The frame goes out as the game left it.
+    if (!g_nr.presentValid || g_nr.presentDepth == nullptr || g_nr.presentMotion == nullptr)
+        return;
+
+    IDXGISwapChain3* sc3 = nullptr;
+
+    if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&sc3))) || sc3 == nullptr)
+    {
+        ReportSkipOnce("present hook: the swapchain cannot name its current backbuffer");
+        return;
+    }
+
+    ID3D12Resource* backbuffer = nullptr;
+    const UINT backbufferIndex = sc3->GetCurrentBackBufferIndex();
+
+    if (FAILED(sc3->GetBuffer(backbufferIndex, IID_PPV_ARGS(&backbuffer))) || backbuffer == nullptr)
+    {
+        ReportSkipOnce("present hook: the backbuffer would not open");
+        sc3->Release();
+        return;
+    }
+
+    sc3->Release();
+
+    ID3D12Device* device = nullptr;
+
+    if (FAILED(backbuffer->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+    {
+        backbuffer->Release();
+        ReportSkipOnce("present hook: the backbuffer belongs to no device");
+        return;
+    }
+
+    // The pass consumes the capture either way -- a skipped present must not make an already-run
+    // frame look like this frame's guides next time around.
+    g_nr.presentValid = false;
+
+    const D3D12_RESOURCE_DESC bbDesc = backbuffer->GetDesc();
+    const auto width = (unsigned int) bbDesc.Width;
+    const auto height = bbDesc.Height;
+
+    if (bbDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || bbDesc.SampleDesc.Count != 1 ||
+        bbDesc.DepthOrArraySize != 1 || width == 0 || height == 0)
+    {
+        ReportSkipOnce("present hook: the backbuffer is not a plain 2D texture");
+        device->Release();
+        backbuffer->Release();
+        return;
+    }
+
+    if (!EnsureForwarder() || !EnsureCapabilityParams(device))
+    {
+        g_nr.failed = true;
+        LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
+        device->Release();
+        backbuffer->Release();
+        return;
+    }
+
+    if (!EnsurePresentExecutor(device))
+    {
+        g_nr.failed = true;
+        g_nr.reason = "present hook: its own command list could not be built";
+        LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
+        device->Release();
+        backbuffer->Release();
+        return;
+    }
+
+    // The previous present's list still running is nearly impossible a whole frame later, but the
+    // check is one read against the rare stall of the swapchain's thread -- so the frame simply
+    // goes without the model. Same answer the RenoDX hook gives a busy slot.
+    if (g_presentFence->GetCompletedValue() < g_presentFenceValue)
+    {
+        static unsigned long long skipped = 0;
+
+        if (++skipped <= 3 || skipped % 300 == 0)
+            LOG_INFO("DLSS-NR present hook: last present's list is still in flight, skipping ({})",
+                     skipped);
+
+        device->Release();
+        backbuffer->Release();
+        return;
+    }
+
+    g_presentAllocator->Reset();
+    g_presentList->Reset(g_presentAllocator, nullptr);
+
+    if (g_gpuTime == nullptr)
+        g_gpuTime = std::make_unique<GpuTime_Dx12>(device);
+
+    if (g_ngxTime == nullptr)
+        g_ngxTime = std::make_unique<GpuTime_Dx12>(device);
+
+    // The backbuffer arrives in PRESENT; the model reads it as a texture.
+    Barrier(g_presentList, backbuffer, D3D12_RESOURCE_STATE_PRESENT,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    if (g_gpuTime != nullptr)
+        g_gpuTime->Start(g_presentList);
+
+    // Stays false while EnsurePresentFeature is mid-create: the frame that builds the feature is
+    // submitted carrying only these barriers, and the first evaluate rides the next frame.
+    bool wroteFrame = false;
+
+    if (EnsurePresentFeature(device, g_presentList, width, height, bbDesc.Format))
+    {
+        TickNrRetired();
+        ++g_frames;
+
+        if (g_ngxTime != nullptr)
+            g_ngxTime->Start(g_presentList);
+
+        // The finished frame is the input and the scratch is the answer, at its own full size --
+        // the model sees exactly what the display would have shown, and the guide pair is what the
+        // upscale evaluate copied aside for this frame.
+        const DlssNrFrameInfo& frame = g_nr.presentFrame;
+
+        // Mirroring the upscale path: the extras are rewritten before every evaluate, nulls
+        // included, so nothing stale sits in the block.
+        SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
+
+        const int result = g_nr.evaluate(
+            g_presentList, g_nr.feature, g_nr.capabilityParams, backbuffer, g_nr.presentDepth,
+            g_nr.presentMotion, g_nr.output, width, height, g_nr.presentGuideWidth,
+            g_nr.presentGuideHeight, g_nr.presentMotionWidth, g_nr.presentMotionHeight,
+            frame.DepthSubrectBaseX, frame.DepthSubrectBaseY, frame.MotionSubrectBaseX,
+            frame.MotionSubrectBaseY, frame.DepthInverted ? 1 : 0, g_nr.reset ? 1 : 0,
+            cfg.DlssNrIntensity.value_or_default(), (int) cfg.DlssNrStyle.value_or_default(),
+            cfg.DlssNrLocalStructure.value_or_default(), cfg.DlssNrLocalTone.value_or_default(),
+            cfg.DlssNrSkinStructure.value_or_default(),
+            cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, frame.MvScaleX, frame.MvScaleY);
+
+        if (g_ngxTime != nullptr)
+            g_ngxTime->End(g_presentList);
+
+        g_nr.reset = false;
+
+        if (result != NVSDK_NGX_Result_Success)
+        {
+            g_nr.failed = true;
+            g_nr.reason = "the model refused to run";
+            LOG_ERROR("DLSS-NR present-hook evaluate returned 0x{:X} ({}), disabling for this "
+                      "session",
+                      (uint32_t) result, NgxResultName((unsigned int) result));
+        }
+        else if (cfg.DlssNrApplyModel.value_or_default())
+        {
+            // The answer replaces the frame wholesale: this is the finished picture either way,
+            // and a strength blend would need the composition the hook method exists to avoid.
+            Barrier(g_presentList, backbuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            Barrier(g_presentList, g_nr.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+            g_presentList->CopyResource(backbuffer, g_nr.output);
+            Barrier(g_presentList, g_nr.output, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Barrier(g_presentList, backbuffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_PRESENT);
+            wroteFrame = true;
+        }
+    }
+
+    if (!wroteFrame)
+        Barrier(g_presentList, backbuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_PRESENT);
+
+    if (g_gpuTime != nullptr)
+    {
+        g_gpuTime->End(g_presentList);
+
+        if (cfg.ShowFps.value_or_default() || State::Instance().menuVisible)
+        {
+            if (auto ms = g_gpuTime->ReadGpuTime(queue); ms.has_value())
+                g_lastGpuTime = ms;
+
+            if (g_ngxTime != nullptr)
+            {
+                if (auto ngx = g_ngxTime->ReadGpuTime(queue); ngx.has_value())
+                    g_lastNgxTime = ngx;
+            }
+        }
+    }
+
+    const HRESULT closeResult = g_presentList->Close();
+
+    if (FAILED(closeResult))
+    {
+        LOG_ERROR("DLSS-NR present hook: command list Close failed ({:X}), the frame goes out "
+                  "unedited",
+                  (UINT) closeResult);
+        device->Release();
+        backbuffer->Release();
+        return;
+    }
+
+    // On the presenting queue, inside the game's own Present -- everything the game recorded for
+    // this frame is ahead of it and everything frame generation submits for it is behind.
+    queue->ExecuteCommandLists(1, (ID3D12CommandList**) &g_presentList);
+    queue->Signal(g_presentFence, ++g_presentFenceValue);
+
+    device->Release();
+    backbuffer->Release();
+}
+
 
 void ProbeD3D11(void* d3d11Device)
 {
@@ -3040,6 +3672,22 @@ void Shutdown()
         g_nr.motionClone->Release();
         g_nr.motionClone = nullptr;
     }
+
+    if (g_nr.presentDepth != nullptr)
+    {
+        g_nr.presentDepth->Release();
+        g_nr.presentDepth = nullptr;
+    }
+
+    if (g_nr.presentMotion != nullptr)
+    {
+        g_nr.presentMotion->Release();
+        g_nr.presentMotion = nullptr;
+    }
+
+    g_nr.presentValid = false;
+
+    ReleasePresentExecutor();
 
     g_capture.release();
     g_gpuTime.reset();

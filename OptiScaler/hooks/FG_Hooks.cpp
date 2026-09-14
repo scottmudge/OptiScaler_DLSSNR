@@ -11,6 +11,7 @@
 
 #include <hudfix/Hudfix_Dx12.h>
 #include <resource_tracking/ResTrack_Dx12.h>
+#include <dlssnr/DlssNrFeature_Dx12.h>
 
 #include <misc/FrameLimit.h>
 
@@ -1214,6 +1215,12 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
             }
         }
     }
+
+    // DLSS-NR's present hook runs here, ahead of frame generation's dispatch: the model edits the
+    // finished backbuffer while it is still a base frame, and FG only ever sees the edited result.
+    // A no-op unless HookMethod = Present (DlssNrHookMethod) is set.
+    if (willPresent)
+        DlssNr::EvaluateAtPresent(This, state.currentCommandQueue);
 
     if (willPresent && fgFeatureActive)
     {

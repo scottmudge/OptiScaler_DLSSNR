@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include <shaders/dlssnr/DlssNr_Common.h>
 #include <nvsdk_ngx.h>
@@ -32,6 +33,20 @@ namespace DlssNr
 // game never does -- so without this the pass runs and never reports what it cost.
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr);
+
+// The present-hook twin of EvaluateAfterUpscale (DlssNrHookMethod = 1). Runs the model over the
+// swapchain's current backbuffer -- the finished, tone-mapped frame, interface and all -- using the
+// depth and motion vectors the last upscale evaluate captured for it, and copies the model's answer
+// straight back over the backbuffer. No tone curve, no white point, no composition: the frame is
+// already display-referred, which is the entire reason this hook exists. Mirrors the "Present" hook
+// of the RenoDX DLSS addon.
+//
+// Called from the swapchain's Present, before frame generation's dispatch, so the model only ever
+// sees base frames and the answer lands inside the present call the game made. Records on its own
+// command list, executed on the presenting queue; a still-in-flight previous record skips the frame
+// rather than stalling the present.
+// Safe to call on every present; with nothing captured, or the setting elsewhere, it does nothing.
+void EvaluateAtPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue);
 
 
 
